@@ -42,6 +42,8 @@ type EnvironmentStatus = {
   hasLocalWhisperModel: boolean;
   hasOllama: boolean;
   hasYtdlp: boolean;
+  hasFaceTracking: boolean;
+  hasCaptionSupport: boolean;
 };
 
 type Project = {
@@ -665,10 +667,14 @@ function App() {
         setAnthropicKey={setAnthropicKey}
         setDeepseekKey={setDeepseekKey}
         setGroqKey={setGroqKey}
+        setOpenrouterKey={setOpenrouterKey}
+        setOpenrouterModel={setOpenrouterModel}
         deepgramKey={deepgramKey}
         anthropicKey={anthropicKey}
         deepseekKey={deepseekKey}
         groqKey={groqKey}
+        openrouterKey={openrouterKey}
+        openrouterModel={openrouterModel}
         refreshEnv={() => refresh()}
       />
     );
@@ -1150,6 +1156,26 @@ function App() {
             <span className={`indicator ${environment?.hasFfmpeg ? "active" : ""}`} title="FFmpeg status">ffmpeg</span>
             <span className={`indicator ${environment?.hasFfprobe ? "active" : ""}`} title="FFprobe status">ffprobe</span>
             <span className={`indicator ${environment?.hasYtdlp ? "active" : ""}`} title="yt-dlp status">yt-dlp</span>
+            <span
+              className={`indicator ${environment?.hasFaceTracking ? "active" : ""}`}
+              title={
+                environment?.hasFaceTracking
+                  ? "Clips crop to follow the speaker's face"
+                  : "Face tracking unavailable - clips will centre-crop. Install OpenCV (pip install opencv-python-headless)"
+              }
+            >
+              Face Track
+            </span>
+            <span
+              className={`indicator ${environment?.hasCaptionSupport ? "active" : ""}`}
+              title={
+                environment?.hasCaptionSupport
+                  ? "Burned-in captions available"
+                  : "Your ffmpeg has no 'drawtext' filter, so clips render without captions. Install an ffmpeg built with libfreetype."
+              }
+            >
+              Captions
+            </span>
             <span className={`indicator ${environment?.hasLocalWhisperModel ? "active" : ""}`} title="Whisper Model status">Whisper Model</span>
             <span className={`indicator ${environment?.hasOllama ? "active" : ""}`} title="Ollama status">Ollama</span>
             <span className={`indicator ${canUseCloudKey ? "active" : ""}`} title="Deepgram Key status">Deepgram</span>
@@ -1388,16 +1414,20 @@ interface OnboardingProps {
   environment: EnvironmentStatus | null;
   onComplete: () => void;
   setTranscriptionEngine: (engine: "deepgram" | "local") => void;
-  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "groq") => void;
+  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "groq" | "openrouter") => void;
   setLocalLlmModel: (model: string) => void;
   setDeepgramKey: (key: string) => void;
   setAnthropicKey: (key: string) => void;
   setDeepseekKey: (key: string) => void;
   setGroqKey: (key: string) => void;
+  setOpenrouterKey: (key: string) => void;
+  setOpenrouterModel: (model: string) => void;
   deepgramKey: string;
   anthropicKey: string;
   deepseekKey: string;
   groqKey: string;
+  openrouterKey: string;
+  openrouterModel: string;
   refreshEnv: () => Promise<void>;
 }
 
@@ -1411,10 +1441,14 @@ function Onboarding({
   setAnthropicKey,
   setDeepseekKey,
   setGroqKey,
+  setOpenrouterKey,
+  setOpenrouterModel,
   deepgramKey: initialDeepgramKey,
   anthropicKey: initialAnthropicKey,
   deepseekKey: initialDeepseekKey,
   groqKey: initialGroqKey,
+  openrouterKey: initialOpenrouterKey,
+  openrouterModel: initialOpenrouterModel,
   refreshEnv,
 }: OnboardingProps) {
   const [setupMode, setSetupMode] = useState<"choose" | "local" | "cloud" | "downloading">("choose");
@@ -1424,6 +1458,23 @@ function Onboarding({
   const [antKey, setAntKey] = useState(initialAnthropicKey);
   const [dsKey, setDsKey] = useState(initialDeepseekKey);
   const [grKey, setGrKey] = useState(initialGroqKey);
+  const [orKey, setOrKey] = useState(initialOpenrouterKey);
+  const [orModel, setOrModel] = useState(initialOpenrouterModel);
+
+  // Transcription can run locally, so a Deepgram key is only mandatory when
+  // Whisper is not installed.
+  const whisperReady = environment?.hasLocalWhisperModel ?? false;
+  const [useLocalWhisper, setUseLocalWhisper] = useState(whisperReady);
+  const [whisperChoiceTouched, setWhisperChoiceTouched] = useState(false);
+
+  // `environment` arrives asynchronously and is null on first render, so the
+  // initial useState value is always false. Adopt the detected default once it
+  // resolves, unless the user has already made a deliberate choice.
+  useEffect(() => {
+    if (!whisperChoiceTouched) {
+      setUseLocalWhisper(whisperReady);
+    }
+  }, [whisperReady, whisperChoiceTouched]);
 
   const [downloadStatus, setDownloadStatus] = useState("Initializing download...");
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -1439,21 +1490,55 @@ function Onboarding({
 
   const handleCloudSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!dgKey.trim()) {
-      setError("Deepgram API Key is required for cloud mode.");
+    const localTranscription = useLocalWhisper && whisperReady;
+
+    if (!localTranscription && !dgKey.trim()) {
+      setError(
+        whisperReady
+          ? "Add a Deepgram API Key, or switch transcription to local Whisper."
+          : "Deepgram API Key is required unless local Whisper is installed."
+      );
       return;
     }
-    if (!antKey.trim() && !dsKey.trim() && !grKey.trim()) {
-      setError("Please provide at least one LLM Key (Claude, DeepSeek, or Groq).");
+    // A key already present in the environment (.env) counts as configured;
+    // the backend falls back to it when the UI supplies none.
+    const envLlm =
+      environment?.hasOpenrouterKey ||
+      environment?.hasAnthropicKey ||
+      environment?.hasDeepseekKey ||
+      environment?.hasGroqKey;
+
+    if (!antKey.trim() && !dsKey.trim() && !grKey.trim() && !orKey.trim() && !envLlm) {
+      setError("Please provide at least one LLM Key (OpenRouter, Claude, DeepSeek, or Groq).");
       return;
     }
 
-    setTranscriptionEngine("deepgram");
-    setDeepgramKey(dgKey.trim());
-    localStorage.setItem("autoshorts_deepgram_key", dgKey.trim());
-    localStorage.setItem("autoshorts_transcription_engine", "deepgram");
+    if (localTranscription) {
+      setTranscriptionEngine("local");
+      localStorage.setItem("autoshorts_transcription_engine", "local");
+    } else {
+      setTranscriptionEngine("deepgram");
+      localStorage.setItem("autoshorts_transcription_engine", "deepgram");
+    }
+    if (dgKey.trim()) {
+      setDeepgramKey(dgKey.trim());
+      localStorage.setItem("autoshorts_deepgram_key", dgKey.trim());
+    }
 
-    if (antKey.trim()) {
+    // OpenRouter first: it fronts every other vendor, so if it is configured it
+    // is almost certainly the intended route.
+    if (orKey.trim() || environment?.hasOpenrouterKey) {
+      setLlmEngine("openrouter");
+      localStorage.setItem("autoshorts_llm_engine", "openrouter");
+      if (orKey.trim()) {
+        setOpenrouterKey(orKey.trim());
+        localStorage.setItem("autoshorts_openrouter_key", orKey.trim());
+      }
+      if (orModel.trim()) {
+        setOpenrouterModel(orModel.trim());
+        localStorage.setItem("autoshorts_openrouter_model", orModel.trim());
+      }
+    } else if (antKey.trim()) {
       setLlmEngine("claude");
       setAnthropicKey(antKey.trim());
       localStorage.setItem("autoshorts_anthropic_key", antKey.trim());
@@ -1684,13 +1769,59 @@ function Onboarding({
             {error && <div className="error-banner" style={{ marginBottom: "16px" }}>{error}</div>}
 
             <div className="form-stack">
+              {whisperReady && (
+                <div className="input-group">
+                  <label>Transcription</label>
+                  <label style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: 400 }}>
+                    <input
+                      type="checkbox"
+                      checked={useLocalWhisper}
+                      onChange={(e) => {
+                        setWhisperChoiceTouched(true);
+                        setUseLocalWhisper(e.target.checked);
+                      }}
+                    />
+                    Use local Whisper (free, no Deepgram key needed)
+                  </label>
+                </div>
+              )}
+
               <div className="input-group">
-                <label>Deepgram API Key *</label>
+                <label>Deepgram API Key {useLocalWhisper && whisperReady ? "" : "*"}</label>
                 <input
                   type="password"
                   value={dgKey}
                   onChange={(e) => setDgKey(e.target.value)}
-                  placeholder="Insert your Deepgram API Key (for transcription)"
+                  placeholder={
+                    useLocalWhisper && whisperReady
+                      ? "Not needed - transcription runs locally"
+                      : "Insert your Deepgram API Key (for transcription)"
+                  }
+                  disabled={useLocalWhisper && whisperReady}
+                />
+              </div>
+
+              <div className="input-group">
+                <label>OpenRouter API Key</label>
+                <input
+                  type="password"
+                  value={orKey}
+                  onChange={(e) => setOrKey(e.target.value)}
+                  placeholder={
+                    environment?.hasOpenrouterKey
+                      ? "Already set in .env - leave blank to use it"
+                      : "Insert your OpenRouter API Key (moment detection)"
+                  }
+                />
+              </div>
+
+              <div className="input-group">
+                <label>OpenRouter Model</label>
+                <input
+                  type="text"
+                  value={orModel}
+                  onChange={(e) => setOrModel(e.target.value)}
+                  placeholder="anthropic/claude-sonnet-4.5"
                 />
               </div>
 
@@ -1723,7 +1854,11 @@ function Onboarding({
                   placeholder="Insert your Groq API Key (alternative moment detection)"
                 />
               </div>
-              <p className="form-help">* Deepgram Key + at least one LLM Key (Claude, DeepSeek, or Groq) is required.</p>
+              <p className="form-help">
+                {useLocalWhisper && whisperReady
+                  ? "Transcription runs locally. One LLM key (OpenRouter, Claude, DeepSeek, or Groq) is required."
+                  : "* Deepgram Key + at least one LLM Key (OpenRouter, Claude, DeepSeek, or Groq) is required."}
+              </p>
             </div>
 
             <div className="onboarding-actions">

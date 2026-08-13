@@ -1,7 +1,10 @@
+mod captions;
 mod db;
+mod facetrack;
 mod llm;
 mod media;
 mod models;
+mod pyenv;
 mod transcription;
 
 use std::path::PathBuf;
@@ -59,6 +62,10 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         has_local_whisper_model,
         has_ollama,
         has_ytdlp: media::command_exists("yt-dlp"),
+        has_face_tracking: facetrack::available(),
+        // Either renderer can burn in captions: ffmpeg's drawtext, or the
+        // Pillow overlay that works on builds lacking it.
+        has_caption_support: media::supports_captions() || captions::available(),
     })
 }
 
@@ -549,15 +556,17 @@ async fn render_flat_clip_for_candidate(
 
         let mut srt_path = None;
         let mut drawtext_filters = None;
+        let mut caption_track = None;
 
         let probe = media::probe_media(&project.source_path).ok();
-        let cropped_width = if let Some(p) = &probe {
+        let (cropped_width, cropped_height) = if let Some(p) = &probe {
             let iw = p.width.unwrap_or(1920) as f64;
             let ih = p.height.unwrap_or(1080) as f64;
             let w = (iw.min(ih * 9.0 / 16.0) / 2.0).floor() * 2.0;
-            w as i64
+            let h = (ih.min(iw * 16.0 / 9.0) / 2.0).floor() * 2.0;
+            (w as i64, h as i64)
         } else {
-            1080
+            (1080, 1920)
         };
 
         if let Ok(Some(transcript_record)) = db.latest_transcript(&project.id) {
@@ -568,15 +577,30 @@ async fn render_flat_clip_for_candidate(
                     srt_path = Some(clip_srt_path);
                 }
                 let style = project.caption_style.as_deref().unwrap_or("modern-box");
-                let drawtext = build_drawtext_filters(
+
+                // Preferred path: rasterised overlay. It works on any ffmpeg
+                // build and preserves punctuation that drawtext strips.
+                caption_track = captions::render_track(
                     &normalized.words,
                     candidate.start_sec,
                     candidate.end_sec,
                     cropped_width,
+                    cropped_height,
                     style,
+                    &std::env::temp_dir(),
                 );
-                if !drawtext.is_empty() {
-                    drawtext_filters = Some(drawtext);
+
+                if caption_track.is_none() {
+                    let drawtext = build_drawtext_filters(
+                        &normalized.words,
+                        candidate.start_sec,
+                        candidate.end_sec,
+                        cropped_width,
+                        style,
+                    );
+                    if !drawtext.is_empty() {
+                        drawtext_filters = Some(drawtext);
+                    }
                 }
             }
         }
@@ -587,6 +611,7 @@ async fn render_flat_clip_for_candidate(
             candidate.end_sec,
             &output_path,
             drawtext_filters.as_deref(),
+            caption_track.as_ref().map(|t| t.concat_list.as_path()),
         ) {
             Ok(path) => {
                 let path_string = path.to_string_lossy().to_string();
@@ -610,6 +635,7 @@ async fn render_flat_clip_for_candidate(
                     candidate.start_sec,
                     candidate.end_sec,
                     &output_path,
+                    None,
                     None,
                 ) {
                     Ok(path) => {

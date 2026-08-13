@@ -17,6 +17,8 @@ pub struct EnvironmentStatus {
     pub has_local_whisper_model: bool,
     pub has_ollama: bool,
     pub has_ytdlp: bool,
+    pub has_face_tracking: bool,
+    pub has_caption_support: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

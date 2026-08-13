@@ -138,59 +138,23 @@ pub fn build_segments(words: &[TranscriptWord]) -> Vec<TranscriptSegment> {
 }
 
 pub fn find_python_command() -> Option<String> {
-    let candidates: &[&str] = if cfg!(windows) {
-        &["python", "py", "python3"]
-    } else {
-        &["python3", "python"]
-    };
+    // Prefer an interpreter that actually has Whisper; otherwise any Python, so
+    // callers can still report a useful "not installed" error.
+    crate::pyenv::find_with_module("whisper").or_else(crate::pyenv::find_any)
+}
 
-    for &cmd in candidates {
-        if let Ok(out) = std::process::Command::new(cmd).args(["-c", "import whisper"]).output() {
-            if out.status.success() {
-                return Some(cmd.to_string());
-            }
-        }
-    }
-    for &cmd in candidates {
-        if std::process::Command::new(cmd).arg("--version").output().is_ok() {
-            return Some(cmd.to_string());
-        }
-    }
-    None
+/// Path to the `whisper` CLI, if installed. Checked before the Python module
+/// route because it is faster to invoke.
+pub fn whisper_cli_path() -> Option<String> {
+    crate::pyenv::find_venv_script("whisper")
 }
 
 pub fn whisper_cli_exists() -> bool {
-    let candidates: &[&str] = if cfg!(windows) {
-        &["whisper", "whisper.exe"]
-    } else {
-        &["whisper"]
-    };
-
-    for &cmd in candidates {
-        if let Ok(out) = std::process::Command::new(cmd).arg("--help").output() {
-            if out.status.success() {
-                return true;
-            }
-        }
-    }
-    false
+    whisper_cli_path().is_some()
 }
 
 pub fn whisper_python_exists() -> bool {
-    let candidates: &[&str] = if cfg!(windows) {
-        &["python", "py", "python3"]
-    } else {
-        &["python3", "python"]
-    };
-
-    for &cmd in candidates {
-        if let Ok(out) = std::process::Command::new(cmd).args(["-c", "import whisper"]).output() {
-            if out.status.success() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::pyenv::find_with_module("whisper").is_some()
 }
 
 fn normalize_whisper_raw_json(raw: serde_json::Value) -> Result<NormalizedTranscript> {
@@ -251,7 +215,7 @@ pub async fn transcribe_local(audio_path: &str, model_path: &str) -> Result<Norm
     let audio_path = audio_path.to_string();
     let model_path = model_path.to_string();
 
-    if whisper_cli_exists() {
+    if let Some(whisper_cli) = whisper_cli_path() {
         let audio_path_buf = std::path::Path::new(&audio_path);
         let audio_dir = audio_path_buf.parent().ok_or_else(|| anyhow!("Invalid audio path parent"))?;
         let audio_stem = audio_path_buf.file_stem().ok_or_else(|| anyhow!("Invalid audio file stem"))?.to_string_lossy();
@@ -263,7 +227,7 @@ pub async fn transcribe_local(audio_path: &str, model_path: &str) -> Result<Norm
         let audio_stem_clone = audio_stem.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let output = std::process::Command::new("whisper")
+            let output = std::process::Command::new(&whisper_cli)
                 .arg(&audio_path)
                 .args(["--model", "base"])
                 .args(["--output_format", "json"])

@@ -287,10 +287,18 @@ Transcript:
         .or_else(|| std::env::var("OPENROUTER_MODEL").ok().filter(|m| !m.trim().is_empty()))
         .unwrap_or(default_model);
 
-    let response = reqwest::Client::new()
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
+    // OpenRouter fronts many vendors and not all accept `response_format`.
+    // Anthropic models in particular reject JSON mode, so it is requested only
+    // where supported, and a rejection is retried without it. The parser
+    // tolerates prose-wrapped JSON either way.
+    let supports_json_mode = {
+        let m = model.to_lowercase();
+        !(m.contains("anthropic") || m.contains("claude"))
+    };
+
+    let client = reqwest::Client::new();
+    let build_body = |json_mode: bool| {
+        let mut body = json!({
             "model": model,
             "messages": [
                 {
@@ -299,13 +307,40 @@ Transcript:
                 }
             ],
             "temperature": 0.2,
-            "response_format": {
-                "type": "json_object"
-            }
-        }))
-        .send()
-        .await
-        .context("calling OpenRouter")?;
+        });
+        if json_mode {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
+        body
+    };
+
+    let send = |json_mode: bool| {
+        client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            // OpenRouter attributes traffic via these; harmless but expected.
+            .header("HTTP-Referer", "https://github.com/JayWebtech/autoshorts")
+            .header("X-Title", "AutoShorts")
+            .json(&build_body(json_mode))
+            .send()
+    };
+
+    let mut json_mode = supports_json_mode;
+    let mut response = send(json_mode).await.context("calling OpenRouter")?;
+
+    if !response.status().is_success() && json_mode {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        // Only a complaint about the JSON-mode parameter is worth retrying.
+        if body.to_lowercase().contains("response_format") {
+            json_mode = false;
+            response = send(json_mode)
+                .await
+                .context("retrying OpenRouter without JSON mode")?;
+        } else {
+            return Err(anyhow!("OpenRouter request failed ({status}): {body}"));
+        }
+    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -566,6 +601,46 @@ fn compact_segments(segments: &[TranscriptSegment]) -> String {
         .join("\n")
 }
 
+/// Find the first balanced JSON object or array inside a model reply.
+///
+/// Not every model can be pinned to JSON mode — Anthropic via OpenRouter, and
+/// local Ollama models, routinely wrap the payload in a sentence or two. Brace
+/// matching (skipping over string literals) recovers it without a regex.
+fn extract_json_span(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+        } else if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return text.get(start..=i);
+            }
+        }
+    }
+    None
+}
+
 fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDraft>> {
     let trimmed = text
         .trim()
@@ -574,7 +649,15 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
         .trim_end_matches("```")
         .trim();
 
-    let val: serde_json::Value = serde_json::from_str(trimmed).context("parsing candidate JSON")?;
+    let val: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(direct_err) => {
+            // Fall back to carving the JSON out of surrounding prose.
+            let span = extract_json_span(trimmed)
+                .ok_or_else(|| anyhow!("parsing candidate JSON: {direct_err}"))?;
+            serde_json::from_str(span).context("parsing candidate JSON")?
+        }
+    };
 
     let candidates_arr = if val.is_array() {
         val.as_array().cloned()
@@ -717,6 +800,176 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
     }
 
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut candidates = suppress_overlaps(candidates, 0.5);
     candidates.truncate(10);
     Ok(candidates)
+}
+
+/// Drop candidates that mostly repeat a higher-scoring one.
+///
+/// Models routinely return the same moment at several different boundaries
+/// (65-100, 65-140, 100-140 ...). Rendering each costs a face-tracking pass and
+/// an encode to produce near-duplicate clips, so the best-scoring version of an
+/// overlapping group wins.
+///
+/// Overlap is measured against the *shorter* candidate, not the union: a 30s
+/// clip wholly inside a 90s one is a duplicate even though it covers only a
+/// third of it.
+fn suppress_overlaps(sorted_by_score: Vec<CandidateDraft>, max_overlap: f64) -> Vec<CandidateDraft> {
+    let mut kept: Vec<CandidateDraft> = Vec::new();
+
+    for candidate in sorted_by_score {
+        let duration = candidate.end - candidate.start;
+        if duration <= 0.0 {
+            continue;
+        }
+
+        let duplicates_existing = kept.iter().any(|k| {
+            let overlap = candidate.end.min(k.end) - candidate.start.max(k.start);
+            if overlap <= 0.0 {
+                return false;
+            }
+            let shorter = duration.min(k.end - k.start);
+            shorter > 0.0 && (overlap / shorter) > max_overlap
+        });
+
+        if !duplicates_existing {
+            kept.push(candidate);
+        }
+    }
+
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_json_wrapped_in_prose() {
+        let reply = "Sure! Here are the best moments:\n{\"candidates\":[]}\nHope that helps.";
+        assert_eq!(extract_json_span(reply), Some("{\"candidates\":[]}"));
+    }
+
+    #[test]
+    fn ignores_braces_inside_strings() {
+        let reply = "text {\"hook\":\"use } now\",\"n\":1} trailing";
+        assert_eq!(
+            extract_json_span(reply),
+            Some("{\"hook\":\"use } now\",\"n\":1}")
+        );
+    }
+
+    #[test]
+    fn handles_escaped_quotes() {
+        let reply = "{\"hook\":\"she said \\\"stop\\\" firmly\"}";
+        assert_eq!(extract_json_span(reply), Some(reply));
+    }
+
+    #[test]
+    fn parses_prose_wrapped_candidates() {
+        let reply = "Here you go:\n{\"candidates\":[{\"start\":10.0,\"end\":50.0,\"score\":0.9,\
+                     \"hook\":\"h\",\"rationale\":\"r\"}]}";
+        let parsed = parse_candidate_json(reply, 30.0).expect("should recover JSON from prose");
+        assert_eq!(parsed.len(), 1);
+    }
+
+    fn draft(start: f64, end: f64, score: f64) -> CandidateDraft {
+        CandidateDraft { start, end, score, hook: "h".into(), rationale: "r".into() }
+    }
+
+    #[test]
+    fn drops_candidate_contained_in_higher_scoring_one() {
+        let out = suppress_overlaps(vec![draft(65.0, 140.0, 0.94), draft(100.0, 140.0, 0.93)], 0.5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 65.0);
+    }
+
+    #[test]
+    fn keeps_adjacent_non_overlapping_moments() {
+        let out = suppress_overlaps(vec![draft(0.0, 60.0, 0.9), draft(60.0, 120.0, 0.8)], 0.5);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn keeps_slightly_overlapping_distinct_moments() {
+        // 10s shared out of a 60s clip is a different moment, not a duplicate.
+        let out = suppress_overlaps(vec![draft(0.0, 60.0, 0.9), draft(50.0, 110.0, 0.8)], 0.5);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn highest_score_wins_within_an_overlapping_group() {
+        let out = suppress_overlaps(
+            vec![draft(140.0, 180.0, 0.97), draft(140.0, 220.0, 0.85), draft(150.0, 175.0, 0.7)],
+            0.5,
+        );
+        assert_eq!(out.len(), 1);
+        assert!((out[0].score - 0.97).abs() < 1e-9);
+    }
+
+    #[test]
+    fn returns_none_when_unbalanced() {
+        assert_eq!(extract_json_span("{\"candidates\": ["), None);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::models::TranscriptSegment;
+
+    fn pregnancy_transcript() -> NormalizedTranscript {
+        // Condensed from a real pregnancy-advice interview: the kind of source
+        // this pipeline targets.
+        let lines: &[(f64, f64, &str)] = &[
+            (0.0, 30.0, "Pregnancy is divided into three trimesters. The first trimester is when the major body parts of the baby are forming."),
+            (30.0, 65.0, "People say the first trimester is very risky. The answer is maybe yes and maybe no. Uncontrolled medical conditions, wrong dietary choices or unsupervised medications at this time can cause birth defects and even miscarriage."),
+            (65.0, 100.0, "Here is the part nobody tells you. Papaya is not dangerous because of the fruit itself. It is the raw, unripe papaya that contains latex, which can trigger contractions. Ripe papaya is completely safe and full of vitamin C."),
+            (100.0, 140.0, "The same confusion exists with fish. Everyone says avoid fish in pregnancy. That is wrong. Low mercury fish like salmon and sardines are one of the best things for your baby's brain development. It is the high mercury fish, shark, swordfish, king mackerel, that you must avoid."),
+            (140.0, 180.0, "Let me tell you the biggest myth of all. Eating for two. You do not need double the calories. In the first trimester you need zero extra calories. Zero. In the second trimester only three hundred forty extra, and in the third about four hundred fifty."),
+            (180.0, 220.0, "Soft cheeses, unpasteurised milk, and deli meats carry listeria risk. Listeria can cross the placenta. This is one of the few things where the warning is genuinely serious and not a myth."),
+            (220.0, 260.0, "Caffeine, you can have up to two hundred milligrams a day, which is about one cup of coffee. You do not have to give it up completely, despite what your relatives will tell you."),
+        ];
+        NormalizedTranscript {
+            language: "en".into(),
+            duration: 260.0,
+            speakers: vec!["Doctor".into()],
+            words: vec![],
+            segments: lines
+                .iter()
+                .map(|(s, e, t)| TranscriptSegment {
+                    start: *s,
+                    end: *e,
+                    speaker: Some("Doctor".into()),
+                    text: (*t).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Hits the live OpenRouter API. Costs a few cents.
+    /// Run with: cargo test --lib -- --ignored --nocapture live_openrouter
+    #[tokio::test]
+    #[ignore]
+    async fn live_openrouter_claude_returns_candidates() {
+        let _ = dotenvy::from_path("../.env");
+        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY not set");
+        let model = std::env::var("OPENROUTER_MODEL")
+            .unwrap_or_else(|_| "anthropic/claude-sonnet-4.5".to_string());
+
+        let out = detect_candidates_with_openrouter(&pregnancy_transcript(), &key, Some(&model))
+            .await
+            .expect("OpenRouter call failed");
+
+        assert!(!out.is_empty(), "no candidates returned");
+        println!("\n=== {} returned {} candidates ===", model, out.len());
+        for c in &out {
+            println!(
+                "  [{:6.1}s -> {:6.1}s] score {:.2}\n    hook: {}",
+                c.start, c.end, c.score, c.hook
+            );
+            assert!(c.end > c.start, "candidate has non-positive duration");
+        }
+    }
 }
