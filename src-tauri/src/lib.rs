@@ -1,9 +1,11 @@
+mod broll;
 mod captions;
 mod db;
 mod facetrack;
 mod llm;
 mod media;
 mod models;
+mod postiz;
 mod pyenv;
 mod transcription;
 
@@ -535,14 +537,107 @@ fn set_selected_clip_count(
 }
 
 #[tauri::command]
-async fn render_flat_clip_for_candidate(
+async fn add_broll_to_clip(
     state: tauri::State<'_, AppState>,
     candidate_id: String,
 ) -> Result<String, String> {
     let db = state.db.clone();
-    let data_dir = state.data_dir.clone();
 
     tokio::task::spawn_blocking(move || {
+        let (candidate, project) = db
+            .get_candidate_with_project(&candidate_id)
+            .map_err(to_command_error)?;
+
+        // B-roll enriches an already-rendered clip, so require the cut first.
+        let detail = db.project_detail(&project.id).map_err(to_command_error)?;
+        let clip = detail
+            .clips
+            .iter()
+            .find(|c| c.candidate_id == candidate_id)
+            .ok_or_else(|| "cut this clip before adding B-roll".to_string())?;
+        let source = clip
+            .output_path
+            .as_deref()
+            .ok_or_else(|| "clip has no rendered file yet".to_string())?;
+        let source = PathBuf::from(source);
+        if !source.exists() {
+            return Err(format!("rendered clip is missing: {}", source.display()));
+        }
+
+        let words = db
+            .latest_transcript(&project.id)
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str::<NormalizedTranscript>(&t.raw_json).ok())
+            .map(|n| n.words)
+            .unwrap_or_default();
+
+        let output = source.with_file_name(format!(
+            "{}_broll.mp4",
+            source.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+
+        // The hook describes what the clip is about, which is what steers scene
+        // selection; fall back to the project name when it is blank.
+        let topic = if candidate.hook.trim().is_empty() {
+            project.name.clone().unwrap_or_else(|| "a short social video".to_string())
+        } else {
+            candidate.hook.clone()
+        };
+
+        let produced = broll::enrich(
+            &source,
+            &words,
+            candidate.start_sec,
+            candidate.end_sec,
+            &topic,
+            &output,
+        )?;
+        Ok(produced.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn postiz_channels() -> Result<Vec<postiz::Channel>, String> {
+    tokio::task::spawn_blocking(postiz::channels)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn publish_clip_to_postiz(
+    video_path: String,
+    caption: String,
+    channel_ids: Vec<String>,
+    schedule_at: Option<String>,
+    dry_run: bool,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(&video_path);
+        if !path.exists() {
+            return Err(format!("video not found: {video_path}"));
+        }
+        postiz::publish(
+            &path,
+            &caption,
+            &channel_ids,
+            schedule_at.as_deref(),
+            dry_run,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The clip-cutting pipeline, independent of Tauri state so it can be exercised
+/// directly in tests as well as from the command.
+pub(crate) fn cut_candidate_blocking(
+    db: Database,
+    data_dir: PathBuf,
+    candidate_id: String,
+) -> Result<String, String> {
         let (candidate, project) = db
             .get_candidate_with_project(&candidate_id)
             .map_err(to_command_error)?;
@@ -666,9 +761,18 @@ async fn render_flat_clip_for_candidate(
                 }
             }
         }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
+
+#[tauri::command]
+async fn render_flat_clip_for_candidate(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+) -> Result<String, String> {
+    let db = state.db.clone();
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || cut_candidate_blocking(db, data_dir, candidate_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -718,7 +822,10 @@ pub fn run() {
             delete_project,
             rename_project,
             check_youtube_copyright,
-            download_youtube_video
+            download_youtube_video,
+            add_broll_to_clip,
+            postiz_channels,
+            publish_clip_to_postiz
         ])
         .run(tauri::generate_context!())
         .expect("error while running AutoShorts");
@@ -1122,5 +1229,50 @@ mod tests {
             assert!(result.contains("fontfile='"));
             assert!(!result.contains("\\:"));
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    /// Runs the real cut pipeline (face tracking + captions + crop) for one
+    /// candidate, exactly as the Tauri command does.
+    /// cargo test --lib -- --ignored --nocapture cut_one_candidate
+    #[test]
+    #[ignore]
+    fn cut_one_candidate() {
+        let _ = dotenvy::from_path("../.env");
+        let candidate_id = std::env::var("CUT_CANDIDATE_ID").expect("CUT_CANDIDATE_ID not set");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+        let out = cut_candidate_blocking(db, data_dir, candidate_id).expect("cut failed");
+        println!("CUT_OUTPUT={out}");
+    }
+
+    /// Runs the app's B-roll enrichment for one candidate, as the command does.
+    /// cargo test --lib -- --ignored --nocapture broll_one_candidate
+    #[test]
+    #[ignore]
+    fn broll_one_candidate() {
+        let _ = dotenvy::from_path("../.env");
+        let candidate_id = std::env::var("CUT_CANDIDATE_ID").expect("CUT_CANDIDATE_ID not set");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+
+        let (candidate, project) = db.get_candidate_with_project(&candidate_id).expect("candidate");
+        let detail = db.project_detail(&project.id).expect("detail");
+        let clip = detail.clips.iter().find(|c| c.candidate_id == candidate_id).expect("clip");
+        let source = PathBuf::from(clip.output_path.as_deref().expect("cut first"));
+
+        let words = db.latest_transcript(&project.id).ok().flatten()
+            .and_then(|t| serde_json::from_str::<NormalizedTranscript>(&t.raw_json).ok())
+            .map(|n| n.words).unwrap_or_default();
+
+        let output = source.with_file_name(format!(
+            "{}_broll.mp4", source.file_stem().unwrap().to_string_lossy()));
+        let produced = broll::enrich(&source, &words, candidate.start_sec, candidate.end_sec,
+                                     &candidate.hook, &output).expect("broll failed");
+        println!("BROLL_OUTPUT={}", produced.display());
     }
 }

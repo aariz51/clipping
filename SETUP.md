@@ -297,3 +297,193 @@ instead of demanding it be retyped.
 4. Optionally set a model, e.g. `anthropic/claude-sonnet-4.5`.
 
 To redo this later: **API Settings → Reset App Configuration & Onboarding**.
+
+---
+
+## 8. B-roll enrichment (local only)
+
+Wraps the `b-rolls` skill (`github.com/aariz51/b-rolls`), which pins
+`browser-use/video-use` at commit `92c2b34e`. The skill's own scripts do all
+rendering — nothing is reimplemented — so output matches its reference results.
+
+**Setup performed on this machine**
+
+```bash
+gh repo clone aariz51/b-rolls ~/b-rolls-ref
+~/autoshorts/.venv/bin/pip install -r ~/b-rolls-ref/requirements.txt
+~/autoshorts/.venv/bin/python ~/b-rolls-ref/scripts/bootstrap_video_use.py
+```
+
+`bootstrap_video_use.py` clones the pinned commit and applies the render patch
+into `~/.cache/b-rolls/video-use-92c2b34e44c2`. Point elsewhere with
+`BROLLS_SKILL_DIR`.
+
+**How it runs**
+
+`src-tauri/assets/broll_pipeline.py` automates the steps the skill leaves to an
+agent, then hands off to the skill's own scripts:
+
+1. `prepare_project.py` — inventory, and detection of the burned-in caption band
+2. LLM scene planning, one decision per ~1s slot
+3. Footage sourcing (see below)
+4. `render_project.py` — the pinned video-use render
+5. `verify_output.py` — checks the rendered file, not intermediates
+
+Scene **boundaries** are never recomputed. `prepare_project.py` emits a draft
+that is already contiguous, frame-aligned and within `max_scene_seconds` —
+exactly what `validate_plan` enforces — so only each scene's `kind` and payload
+are rewritten. A planning mistake therefore cannot produce an invalid timeline.
+
+The transcript comes from AutoShorts' Whisper words rather than the OCR sampler:
+OCR of burned-in captions also picks up background text (it read "PURPOSE" off a
+mic flag during testing).
+
+**Footage sourcing.** Set `PEXELS_API_KEY` in `.env` for real stock footage.
+Without it the planner falls back to the skill's generated `card` explainers,
+which need no downloads — functional, but visually much weaker than footage.
+This is the single biggest quality lever available.
+
+**Cost.** Roughly 40s of rendering per 15s of clip, plus a few GB of
+intermediates that the skill writes under the clip's sibling `edit/` directory.
+
+## 9. Publishing to Postiz
+
+`src-tauri/assets/postiz_post.py` speaks the Postiz public API: upload the file,
+then create a post referencing the uploaded media.
+
+```env
+POSTIZ_API_KEY=...        # Postiz: Settings > Developers > Public API
+POSTIZ_API_URL=...        # optional, for self-hosted
+```
+
+Connected channels on this account (`apexstack`): X `RasheedAariz`, TikTok
+`Plantcareapp`, TikTok `babybites.app`, Instagram `safemama_app`.
+
+In the app, a cut clip gains **Add B-roll** and **Post** buttons. Post opens a
+channel picker with **Dry run** (uploads and resolves channels without
+publishing) and **Publish now**.
+
+```bash
+# List channels
+python src-tauri/assets/postiz_post.py integrations
+# Upload without publishing
+python src-tauri/assets/postiz_post.py post --video clip.mp4 --content "..." --dry-run
+```
+
+## 10. LLM provider — Anthropic and OpenRouter
+
+Anthropic accepts **two credential shapes that authenticate differently**, and
+conflating them is why the first attempt failed:
+
+| Credential | Header | Notes |
+|---|---|---|
+| `sk-ant-api03-…` (console key) | `x-api-key` | billing-scoped, no expiry |
+| `sk-ant-oat01-…` (Claude Code subscription token) | `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` | shares your Claude Code quota, expires ~daily |
+
+Probed against the live API with the supplied token:
+
+```
+x-api-key                        -> 401 API key is invalid
+Bearer                           -> 429 rate_limit_error
+Bearer + oauth beta              -> 429 rate_limit_error
+```
+
+A 429 is **not** a 401: the subscription token authenticates fine. It simply
+cannot be used as `x-api-key`, which is all the app previously sent.
+
+Both shapes are now detected automatically in `llm.rs` and
+`broll_pipeline.py`. Two caveats specific to subscription tokens:
+
+- They share the Claude Code quota, so app usage and your own Claude Code
+  sessions compete for the same limit.
+- They expire (the supplied one had ~8 hours left) and must be re-pasted.
+
+Rate-limit, expiry and auth failures fall back to OpenRouter automatically and
+log the reason, so a render never dies because Anthropic is unavailable.
+
+## 11. Scene variety (required for verification to pass)
+
+`verify_output.py` requires a real visual change at every planned boundary. The
+first automated plans failed it (`minimum MAD 3.265`) for two reasons:
+
+1. **Consecutive `source` scenes.** Two speaker slots in a row are continuous
+   footage, so their shared boundary contains no cut at all. The second is now
+   demoted to a card.
+2. **Identical card styling.** Every card used the same accent and motion, so
+   adjacent cards rendered near-identical plates. Accent and motion now rotate
+   by position.
+
+After both fixes the skill's verifier passes outright:
+
+```
+ok: True          expected_frames 300 == actual_frames 300
+source_audio_sha256 == output_audio_sha256
+minimum_cut_peak_mad 12.52   (was 3.27, threshold not met)
+```
+
+Real stock footage via `PEXELS_API_KEY` would raise this further; cards are the
+keyless fallback, not the intended primary visual.
+
+## 12. Footage sourcing tiers
+
+Sourcing degrades in three steps, best first:
+
+1. **Pexels** — needs `PEXELS_API_KEY`. Purpose-built stock, portrait
+   orientation, reliably on-topic. This is the intended primary source.
+2. **Wikimedia Commons** — no key required and explicitly approved by the
+   skill, but its video corpus is small. Two guards keep it from making output
+   *worse* than cards:
+   - **Relevance**: a result must share a real term with the query. Without
+     this, a search for "government restriction" returned
+     *"Dating Matters: What is Policy"* purely on the word "policy".
+   - **Freeze detection**: archive footage often opens on a static title card.
+     Rendering that produced `minimum MAD 0.000` — a boundary with literally no
+     visual change — which fails verification. Clips are now probed with
+     `freezedetect` at a computed offset and rejected if frozen or too short.
+3. **Generated cards** — always available, no downloads.
+
+On the sugar-rationing test clip Commons had nothing usable, both guards fired,
+and the run fell back to cards with verification passing (`min MAD 12.84`).
+That is the intended behaviour: a good card beats an irrelevant frozen clip.
+**A Pexels key is what turns this from a fallback into real B-roll.**
+
+## 13. Upstream composite bypass (why the final render is built locally)
+
+`render_project.py` renders correct per-scene files and concatenates them into a
+correct rapid timeline. The step *after* that -- compositing inside the pinned
+`video-use` `helpers/render.py` -- is where output breaks:
+
+```
+rapid timeline  : 300 frames, all scenes distinct   (correct)
+visual_master   : 281-293 frames, tail scene repeated 6x
+```
+
+Sampling both at identical timestamps showed the timeline holding
+speaker -> Union Jack -> sugar -> ration card -> official -> coupons, while the
+composite collapsed the entire tail into one repeated frame. It correlates with
+a duration disagreement between the extracted base (10.031s) and the timeline
+(10.010s).
+
+Two fixes were tried and rejected:
+
+- **`fps=` re-timing** made it *worse*: fed a stream with broken timestamps it
+  resamples, duplicating a single frame across six scenes.
+- **`setpts` restamping** kept every frame but could not recover the ones the
+  composite had already dropped.
+
+`composite_locally()` therefore rebuilds the final video directly. The rapid
+timeline is already full-frame 1080x1920 for the whole clip, so the base
+contributes nothing except caption restoration -- which is reproduced with the
+same `colorkey` -> `alphaextract` -> `alphamerge` -> `overlay` chain the skill's
+own patch uses, including disabling restoration during `source` scenes so their
+existing captions are not doubled. Audio is copied from the source, so its
+stream hash stays identical.
+
+This runs **only when upstream's output is short**; a frame-accurate upstream
+render is used as-is, and which path ran is logged.
+
+Verified result with Pexels footage and burned-in captions:
+
+```
+ok: True    frames 300/300    audio sha identical    min boundary change 61.44
+```

@@ -3,28 +3,7 @@ import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import {
-  AudioLines,
-  BadgeCheck,
-  Captions,
-  Check,
-  ChevronRight,
-  Clapperboard,
-  Download,
-  FileVideo,
-  Loader2,
-  Play,
-  RefreshCw,
-  Scissors,
-  SlidersHorizontal,
-  Sparkles,
-  Wand2,
-  Copy,
-  Database,
-  Cloud,
-  Youtube,
-  AlertTriangle,
-} from "lucide-react";
+import { AudioLines, BadgeCheck, Captions, Check, ChevronRight, Clapperboard, Download, FileVideo, Loader2, Play, RefreshCw, Scissors, SlidersHorizontal, Sparkles, Wand2, Copy, Database, Cloud, Youtube, AlertTriangle, Upload } from "lucide-react";
 import "./styles.css";
 
 type EnvironmentStatus = {
@@ -44,6 +23,14 @@ type EnvironmentStatus = {
   hasYtdlp: boolean;
   hasFaceTracking: boolean;
   hasCaptionSupport: boolean;
+};
+
+type PostizChannel = {
+  id: string;
+  name?: string | null;
+  identifier?: string | null;
+  profile?: string | null;
+  disabled: boolean;
 };
 
 type Project = {
@@ -130,6 +117,59 @@ function App() {
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
+  const [brollCandidateId, setBrollCandidateId] = useState<string | null>(null);
+  const [brollPaths, setBrollPaths] = useState<Record<string, string>>({});
+  const [postizChannels, setPostizChannels] = useState<PostizChannel[]>([]);
+  const [postizBusy, setPostizBusy] = useState(false);
+  const [postizTarget, setPostizTarget] = useState<{ path: string; caption: string } | null>(null);
+  const [selectedChannels, setSelectedChannels] = useState<string[]>([]);
+
+  async function addBroll(candidateId: string) {
+    setError(null);
+    setBrollCandidateId(candidateId);
+    try {
+      const out = await invoke<string>("add_broll_to_clip", { candidateId });
+      setBrollPaths((prev) => ({ ...prev, [candidateId]: out }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBrollCandidateId(null);
+    }
+  }
+
+  async function openPostiz(path: string, caption: string) {
+    setError(null);
+    setPostizTarget({ path, caption });
+    try {
+      const channels = await invoke<PostizChannel[]>("postiz_channels");
+      setPostizChannels(channels);
+      setSelectedChannels([]);
+    } catch (err) {
+      setError(String(err));
+      setPostizTarget(null);
+    }
+  }
+
+  async function publishToPostiz(dryRun: boolean) {
+    if (!postizTarget || selectedChannels.length === 0) return;
+    setPostizBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("publish_clip_to_postiz", {
+        videoPath: postizTarget.path,
+        caption: postizTarget.caption,
+        channelIds: selectedChannels,
+        scheduleAt: null,
+        dryRun,
+      });
+      setPostizTarget(null);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setPostizBusy(false);
+    }
+  }
+
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [youtubeStatus, setYoutubeStatus] = useState<"idle" | "checking" | "warning" | "downloading">("idle");
   const [youtubeWarningLicense, setYoutubeWarningLicense] = useState<string | null>(null);
@@ -1066,6 +1106,42 @@ function App() {
                                 {renderingCandidateId === candidate.id ? "Cutting..." : isCut ? "Re-cut" : "Cut"}
                               </button>
                             </div>
+                            {isCut && clip?.outputPath && (
+                              <div className="candidate-actions" style={{ marginTop: "6px" }}>
+                                <button
+                                  className="cut-button"
+                                  onClick={() => void addBroll(candidate.id)}
+                                  disabled={busy !== "idle" || brollCandidateId !== null}
+                                  title="Add speech-matched B-roll using the b-rolls pipeline"
+                                >
+                                  {brollCandidateId === candidate.id ? (
+                                    <Loader2 className="spin" size={14} />
+                                  ) : (
+                                    <Sparkles size={14} />
+                                  )}
+                                  {brollCandidateId === candidate.id ? "Adding B-roll..." : "Add B-roll"}
+                                </button>
+                                <button
+                                  className="cut-button"
+                                  onClick={() =>
+                                    void openPostiz(
+                                      brollPaths[candidate.id] || clip.outputPath!,
+                                      candidate.hook,
+                                    )
+                                  }
+                                  disabled={busy !== "idle"}
+                                  title="Publish this clip to your connected Postiz channels"
+                                >
+                                  <Upload size={14} />
+                                  Post
+                                </button>
+                              </div>
+                            )}
+                            {brollPaths[candidate.id] && (
+                              <div className="output-path" style={{ background: "rgba(142, 230, 199, 0.05)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)", marginTop: "4px" }}>
+                                B-roll: {brollPaths[candidate.id]}
+                              </div>
+                            )}
                             {clip?.outputPath && <div className="output-path">{clip.outputPath}</div>}
                             {clip?.captionAssPath && (
                               <div className="output-path" style={{ background: "rgba(142, 230, 199, 0.05)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)", marginTop: "4px" }}>
@@ -1283,6 +1359,60 @@ function App() {
           </div>
         </div>
       )}
+      {postizTarget && (
+        <div className="onboarding-overlay" style={{ zIndex: 20001 }}>
+          <div className="onboarding-card" style={{ maxWidth: "520px" }}>
+            <div className="onboarding-header compact">
+              <h2>Post to Postiz</h2>
+              <p>Select the channels to publish this clip to.</p>
+            </div>
+            <div className="output-path" style={{ marginBottom: "12px" }}>{postizTarget.path}</div>
+            <div className="form-stack" style={{ maxHeight: "260px", overflowY: "auto" }}>
+              {postizChannels.length === 0 && <p className="form-help">No channels connected in Postiz.</p>}
+              {postizChannels.map((ch) => (
+                <label key={ch.id} style={{ display: "flex", gap: "10px", alignItems: "center", padding: "6px 0" }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedChannels.includes(ch.id)}
+                    onChange={(e) =>
+                      setSelectedChannels((prev) =>
+                        e.target.checked ? [...prev, ch.id] : prev.filter((id) => id !== ch.id),
+                      )
+                    }
+                  />
+                  <span>{ch.name || ch.profile || ch.id}</span>
+                  <span className="candidate-score">{ch.identifier}</span>
+                </label>
+              ))}
+            </div>
+            <p className="form-help">
+              Publishing sends this video to the selected accounts immediately. Use Dry run to
+              upload and verify without posting.
+            </p>
+            <div className="onboarding-actions">
+              <button className="icon-button" onClick={() => setPostizTarget(null)} disabled={postizBusy}>
+                Cancel
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => void publishToPostiz(true)}
+                disabled={postizBusy || selectedChannels.length === 0}
+              >
+                Dry run
+              </button>
+              <button
+                className="primary-action compact"
+                onClick={() => void publishToPostiz(false)}
+                disabled={postizBusy || selectedChannels.length === 0}
+              >
+                {postizBusy ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
+                Publish now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {downloadingModelName && (
         <div className="onboarding-overlay" style={{ zIndex: 20000 }}>
           <div className="onboarding-card" style={{ maxWidth: '480px', textAlign: 'center' }}>

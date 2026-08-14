@@ -458,13 +458,27 @@ Transcript:
     let model =
         std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string());
 
-    let response = reqwest::Client::new()
+    // Anthropic accepts two credential shapes and they authenticate differently.
+    // Console keys (`sk-ant-api...`) go in `x-api-key`. Claude Code subscription
+    // tokens (`sk-ant-oat...`) are OAuth access tokens: they authenticate as a
+    // bearer token with the OAuth beta header, and are rejected outright by
+    // `x-api-key`.
+    let is_oauth = api_key.starts_with("sk-ant-oat");
+    let mut builder = reqwest::Client::new()
         .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+    builder = if is_oauth {
+        builder
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+    } else {
+        builder.header("x-api-key", api_key)
+    };
+
+    let response = builder
         .json(&json!({
             "model": model,
-            "max_tokens": 1800,
+            "max_tokens": 8000,
             "temperature": 0.2,
             "messages": [
                 ClaudeMessage {
@@ -945,6 +959,35 @@ mod live_tests {
                     text: (*t).into(),
                 })
                 .collect(),
+        }
+    }
+
+    /// Validates whatever is in ANTHROPIC_API_KEY against the real API through
+    /// the app's own provider path. Run with:
+    ///   cargo test --lib -- --ignored --nocapture live_anthropic
+
+
+    /// Hits the live Anthropic API with whichever credential `.env` holds,
+    /// proving the app's own moment detection works with a subscription token.
+    /// Run: cargo test --lib -- --ignored --nocapture live_anthropic
+    #[tokio::test]
+    #[ignore]
+    async fn live_anthropic_returns_candidates() {
+        let _ = dotenvy::from_path("../.env");
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
+            .expect("no Anthropic credential in .env");
+        let kind = if key.starts_with("sk-ant-oat") { "subscription token" } else { "API key" };
+        println!("\n=== Anthropic via {} ({}) ===", kind,
+                 std::env::var("ANTHROPIC_MODEL").unwrap_or_default());
+
+        let out = detect_candidates_with_claude(&pregnancy_transcript(), &key)
+            .await
+            .expect("Anthropic call failed");
+        assert!(!out.is_empty(), "no candidates returned");
+        for c in &out {
+            println!("  [{:6.1}s -> {:6.1}s] {:.2}  {}", c.start, c.end, c.score, c.hook);
+            assert!(c.end > c.start);
         }
     }
 
