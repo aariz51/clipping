@@ -23,6 +23,8 @@ type EnvironmentStatus = {
   hasYtdlp: boolean;
   hasFaceTracking: boolean;
   hasCaptionSupport: boolean;
+  hasOutro: boolean;
+  hasVoiceClone: boolean;
 };
 
 type PostizChannel = {
@@ -34,6 +36,8 @@ type PostizChannel = {
 };
 
 type Project = {
+  brandName?: string | null;
+  brandLogoPath?: string | null;
   id: string;
   name: string | null;
   sourcePath: string;
@@ -114,11 +118,16 @@ function App() {
   const [renderingCandidateId, setRenderingCandidateId] = useState<string | null>(null);
   const [showStyleModal, setShowStyleModal] = useState(false);
   const [selectedStyle, setSelectedStyle] = useState("modern-box");
+  // Branding for the end card, captured with the caption style at import time.
+  const [brandName, setBrandName] = useState(() => localStorage.getItem("autoshorts_brand_name") || "");
+  const [brandLogo, setBrandLogo] = useState(() => localStorage.getItem("autoshorts_brand_logo") || "");
   const [mediaPathToImport, setMediaPathToImport] = useState<string | null>(null);
 
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
   const [brollCandidateId, setBrollCandidateId] = useState<string | null>(null);
   const [brollPaths, setBrollPaths] = useState<Record<string, string>>({});
+  const [outroCandidateId, setOutroCandidateId] = useState<string | null>(null);
+  const [outroPaths, setOutroPaths] = useState<Record<string, string>>({});
   const [postizChannels, setPostizChannels] = useState<PostizChannel[]>([]);
   const [postizBusy, setPostizBusy] = useState(false);
   const [postizTarget, setPostizTarget] = useState<{ path: string; caption: string } | null>(null);
@@ -134,6 +143,19 @@ function App() {
       setError(String(err));
     } finally {
       setBrollCandidateId(null);
+    }
+  }
+
+  async function addOutro(candidateId: string, videoPath: string) {
+    setError(null);
+    setOutroCandidateId(candidateId);
+    try {
+      const out = await invoke<string>("add_outro_to_clip", { candidateId, videoPath });
+      setOutroPaths((prev) => ({ ...prev, [candidateId]: out }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setOutroCandidateId(null);
     }
   }
 
@@ -432,6 +454,14 @@ function App() {
     }
   }
 
+  async function pickLogo() {
+    const chosen = await open({
+      multiple: false,
+      filters: [{ name: "Logo", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    });
+    if (typeof chosen === "string") setBrandLogo(chosen);
+  }
+
   async function confirmImport(style: string) {
     if (!mediaPathToImport) return;
     const selected = mediaPathToImport;
@@ -444,7 +474,11 @@ function App() {
         path: selected,
         transcriptionMode: transcriptionEngine === "local" ? "local" : "cloud",
         captionStyle: style,
+        brandName: brandName.trim() || null,
+        brandLogoPath: brandLogo.trim() || null,
       });
+      localStorage.setItem("autoshorts_brand_name", brandName.trim());
+      localStorage.setItem("autoshorts_brand_logo", brandLogo.trim());
       newProjectId = project.id;
       await refresh(project.id);
     });
@@ -1121,11 +1155,33 @@ function App() {
                                   )}
                                   {brollCandidateId === candidate.id ? "Adding B-roll..." : "Add B-roll"}
                                 </button>
+                                {detail.project.brandName ? (
+                                <button
+                                  className="cut-button"
+                                  onClick={() =>
+                                    void addOutro(
+                                      candidate.id,
+                                      brollPaths[candidate.id] || clip.outputPath!,
+                                    )
+                                  }
+                                  disabled={busy !== "idle" || outroCandidateId !== null}
+                                  title="Append the app logo and a download line in the clip's own voice"
+                                >
+                                  {outroCandidateId === candidate.id ? (
+                                    <Loader2 className="spin" size={14} />
+                                  ) : (
+                                    <Download size={14} />
+                                  )}
+                                  {outroCandidateId === candidate.id ? "Adding outro..." : "Add Outro"}
+                                </button>
+                                ) : null}
                                 <button
                                   className="cut-button"
                                   onClick={() =>
                                     void openPostiz(
-                                      brollPaths[candidate.id] || clip.outputPath!,
+                                      outroPaths[candidate.id] ||
+                                        brollPaths[candidate.id] ||
+                                        clip.outputPath!,
                                       candidate.hook,
                                     )
                                   }
@@ -1135,6 +1191,11 @@ function App() {
                                   <Upload size={14} />
                                   Post
                                 </button>
+                              </div>
+                            )}
+                            {outroPaths[candidate.id] && (
+                              <div className="output-path" style={{ background: "rgba(142, 230, 199, 0.05)", borderColor: "var(--accent-primary)", color: "var(--accent-primary)", marginTop: "4px" }}>
+                                Final (with outro): {outroPaths[candidate.id]}
                               </div>
                             )}
                             {brollPaths[candidate.id] && (
@@ -1252,6 +1313,18 @@ function App() {
             >
               Captions
             </span>
+            <span
+              className={`indicator ${environment?.hasVoiceClone ? "active" : environment?.hasOutro ? "active" : ""}`}
+              title={
+                environment?.hasVoiceClone
+                  ? "End card with a voice cloned from the clip"
+                  : environment?.hasOutro
+                    ? "End card available, but silent - install the TTS environment for the spoken line"
+                    : "End card unavailable (Pillow missing)"
+              }
+            >
+              Outro
+            </span>
             <span className={`indicator ${environment?.hasLocalWhisperModel ? "active" : ""}`} title="Whisper Model status">Whisper Model</span>
             <span className={`indicator ${environment?.hasOllama ? "active" : ""}`} title="Ollama status">Ollama</span>
             <span className={`indicator ${canUseCloudKey ? "active" : ""}`} title="Deepgram Key status">Deepgram</span>
@@ -1346,6 +1419,38 @@ function App() {
                 <div className="style-card-title">Vibrant Red</div>
                 <div className="style-card-desc">Dramatic neon crimson text with outline and drop shadow (gaming/action style).</div>
               </div>
+            </div>
+
+            <div className="style-modal-header" style={{ marginTop: "18px" }}>
+              <h3 style={{ fontSize: "1.05rem" }}>App branding (optional)</h3>
+              <p>Shown on an end card after each clip, spoken in the clip's own voice.</p>
+            </div>
+            <div className="form-stack" style={{ padding: "0 4px" }}>
+              <div className="input-group">
+                <label>App name</label>
+                <input
+                  type="text"
+                  value={brandName}
+                  onChange={(e) => setBrandName(e.target.value)}
+                  placeholder="e.g. LabelWise: Food Scanner"
+                />
+              </div>
+              <div className="input-group">
+                <label>App logo</label>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <input
+                    type="text"
+                    value={brandLogo}
+                    onChange={(e) => setBrandLogo(e.target.value)}
+                    placeholder="Path to a PNG logo"
+                    style={{ flex: 1 }}
+                  />
+                  <button type="button" className="icon-button" onClick={() => void pickLogo()}>
+                    Browse
+                  </button>
+                </div>
+              </div>
+              <p className="form-help">Leave blank to render clips without an end card.</p>
             </div>
 
             <div className="style-modal-actions">

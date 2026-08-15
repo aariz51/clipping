@@ -7,3 +7,4 @@ src-tauri/target
 *.log
 .venv
 .playwright-mcp
+__pycache__/

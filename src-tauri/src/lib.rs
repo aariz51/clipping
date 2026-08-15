@@ -5,6 +5,7 @@ mod facetrack;
 mod llm;
 mod media;
 mod models;
+mod outro;
 mod postiz;
 mod pyenv;
 mod transcription;
@@ -68,6 +69,8 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         // Either renderer can burn in captions: ffmpeg's drawtext, or the
         // Pillow overlay that works on builds lacking it.
         has_caption_support: media::supports_captions() || captions::available(),
+        has_outro: outro::available(),
+        has_voice_clone: outro::can_clone_voice(),
     })
 }
 
@@ -290,6 +293,8 @@ fn create_project_from_path(
     path: String,
     transcription_mode: String,
     caption_style: String,
+    brand_name: Option<String>,
+    brand_logo_path: Option<String>,
 ) -> Result<Project, String> {
     validate_media_extension(&path).map_err(to_command_error)?;
     let probe = media::probe_media(&path).ok();
@@ -301,6 +306,8 @@ fn create_project_from_path(
             &transcription_mode,
             &caption_style,
             probe.and_then(|probe| probe.duration_sec),
+            brand_name.as_deref(),
+            brand_logo_path.as_deref(),
         )
         .map_err(to_command_error)
 }
@@ -599,6 +606,87 @@ async fn add_broll_to_clip(
     .map_err(|e| e.to_string())?
 }
 
+/// Appending the branded end card, independent of Tauri state so the same code
+/// the button calls can be exercised directly in tests.
+pub(crate) fn add_outro_blocking(
+    db: Database,
+    candidate_id: String,
+    video_path: String,
+) -> Result<String, String> {
+        let (candidate, project) = db
+            .get_candidate_with_project(&candidate_id)
+            .map_err(to_command_error)?;
+
+        let app_name = project
+            .brand_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| "no app name set for this project".to_string())?;
+
+        let source = PathBuf::from(&video_path);
+        if !source.exists() {
+            return Err(format!("video not found: {video_path}"));
+        }
+
+        // The outro is appended last, so whichever artefact the user is about to
+        // publish -- the plain cut or the B-roll version -- gets the end card.
+        let output = source.with_file_name(format!(
+            "{}_final.mp4",
+            source.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+
+        // Word timings let the voice picker separate speakers; without them the
+        // middle of the clip is sampled instead.
+        let transcript = db
+            .latest_transcript(&project.id)
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str::<NormalizedTranscript>(&t.raw_json).ok())
+            .and_then(|n| {
+                let words: Vec<_> = n
+                    .words
+                    .iter()
+                    .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+                    .map(|w| {
+                        serde_json::json!({
+                            "text": w.text,
+                            "start": w.start - candidate.start_sec,
+                            "end": w.end - candidate.start_sec,
+                            "speaker": w.speaker,
+                        })
+                    })
+                    .collect();
+                if words.is_empty() {
+                    return None;
+                }
+                let path = source.with_extension("outro_words.json");
+                std::fs::write(&path, serde_json::json!({ "words": words }).to_string()).ok()?;
+                Some(path)
+            });
+
+        let logo = project.brand_logo_path.as_ref().map(PathBuf::from);
+        let produced = outro::append(
+            &source,
+            &app_name,
+            logo.as_deref(),
+            transcript.as_deref(),
+            &output,
+        )?;
+        Ok(produced.to_string_lossy().to_string())
+    }
+
+#[tauri::command]
+async fn add_outro_to_clip(
+    state: tauri::State<'_, AppState>,
+    candidate_id: String,
+    video_path: String,
+) -> Result<String, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || add_outro_blocking(db, candidate_id, video_path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn postiz_channels() -> Result<Vec<postiz::Channel>, String> {
     tokio::task::spawn_blocking(postiz::channels)
@@ -824,6 +912,7 @@ pub fn run() {
             check_youtube_copyright,
             download_youtube_video,
             add_broll_to_clip,
+            add_outro_to_clip,
             postiz_channels,
             publish_clip_to_postiz
         ])
@@ -912,9 +1001,32 @@ fn project_dir(state: &AppState, project_id: &str) -> PathBuf {
 fn documents_project_dir(project: &Project) -> Result<PathBuf, String> {
     let documents_dir = dirs::document_dir()
         .ok_or_else(|| "Could not find your Documents folder for clip output.".to_string())?;
-    Ok(documents_dir
-        .join("AutoShorts")
-        .join(project_output_slug(project)))
+    let base = documents_dir.join("AutoShorts").join(project_output_slug(project));
+
+    // The slug comes from the source filename alone, so importing the same
+    // video twice would point both projects at one folder and silently
+    // overwrite `clip-01_flat.mp4`. A marker records which project owns the
+    // directory; later projects get their own suffixed folder.
+    let marker = base.join(".project-id");
+    match std::fs::read_to_string(&marker) {
+        Ok(owner) if owner.trim() != project.id => {
+            let short: String = project.id.chars().take(8).collect();
+            let mine = base.with_file_name(format!(
+                "{}-{}",
+                base.file_name().unwrap_or_default().to_string_lossy(),
+                short
+            ));
+            let _ = std::fs::create_dir_all(&mine);
+            let _ = std::fs::write(mine.join(".project-id"), &project.id);
+            Ok(mine)
+        }
+        Ok(_) => Ok(base),
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&base);
+            let _ = std::fs::write(&marker, &project.id);
+            Ok(base)
+        }
+    }
 }
 
 fn project_output_slug(project: &Project) -> String {
@@ -1274,5 +1386,169 @@ mod pipeline_tests {
         let produced = broll::enrich(&source, &words, candidate.start_sec, candidate.end_sec,
                                      &candidate.hook, &output).expect("broll failed");
         println!("BROLL_OUTPUT={}", produced.display());
+    }
+
+    /// Drives the three buttons' code paths in order on an existing project:
+    /// Cut -> Add B-roll -> Add Outro.
+    /// BTN_CANDIDATE=<id> cargo test --lib -- --ignored --nocapture button_flow
+    #[test]
+    #[ignore]
+    fn button_flow() {
+        let _ = dotenvy::from_path("../.env");
+        let candidate_id = std::env::var("BTN_CANDIDATE").expect("BTN_CANDIDATE not set");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+
+        // 1. Cut button
+        let cut = cut_candidate_blocking(db.clone(), data_dir.clone(), candidate_id.clone())
+            .expect("cut failed");
+        println!("STEP1_CUT={cut}");
+
+        // 2. Add B-roll button
+        let (candidate, project) = db.get_candidate_with_project(&candidate_id).expect("cand");
+        let words = db.latest_transcript(&project.id).ok().flatten()
+            .and_then(|t| serde_json::from_str::<NormalizedTranscript>(&t.raw_json).ok())
+            .map(|n| n.words).unwrap_or_default();
+        let cut_path = PathBuf::from(&cut);
+        let broll_out = cut_path.with_file_name(format!(
+            "{}_broll.mp4", cut_path.file_stem().unwrap().to_string_lossy()));
+        let brolled = broll::enrich(&cut_path, &words, candidate.start_sec, candidate.end_sec,
+                                    &candidate.hook, &broll_out).expect("broll failed");
+        println!("STEP2_BROLL={}", brolled.display());
+
+        // 3. Add Outro button - the exact command the button invokes. Branding
+        // is optional, so a project without an app name must refuse cleanly and
+        // leave the B-roll cut as the finished video.
+        match add_outro_blocking(db, candidate_id, brolled.to_string_lossy().to_string()) {
+            Ok(final_path) => println!("STEP3_FINAL={final_path}"),
+            Err(reason) if project.brand_name.is_none() => {
+                println!("STEP3_SKIPPED (no branding, as expected): {reason}")
+            }
+            Err(reason) => panic!("outro failed on a branded project: {reason}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+
+    /// Whole pipeline on one source video, through the app's own code paths:
+    /// import -> transcribe -> rank -> cut (captions) -> B-roll -> branded outro.
+    ///
+    /// E2E_SOURCE=/path/to.mp4 E2E_APP="Name" E2E_LOGO=/path/to.png \
+    ///   cargo test --lib -- --ignored --nocapture full_pipeline
+    #[tokio::test]
+    #[ignore]
+    async fn full_pipeline() {
+        let _ = dotenvy::from_path("../.env");
+        let source = std::env::var("E2E_SOURCE").expect("E2E_SOURCE not set");
+        let app_name = std::env::var("E2E_APP").unwrap_or_else(|_| "My App".into());
+        let logo = std::env::var("E2E_LOGO").ok();
+
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+
+        let probe = media::probe_media(&source).ok();
+        let project = db
+            .create_project(&source, "local", "classic-outline",
+                            probe.and_then(|p| p.duration_sec),
+                            Some(&app_name), logo.as_deref())
+            .expect("create project");
+        println!("PROJECT={}", project.id);
+
+        // 1. Transcribe with local Whisper.
+        let project_dir = data_dir.join("projects").join(&project.id);
+        let audio = media::extract_audio(&source, &project_dir).expect("extract audio");
+        println!("transcribing (this is the slow step)...");
+        let normalized = transcription::transcribe_local(
+            &audio.to_string_lossy(), &data_dir.to_string_lossy())
+            .await.expect("transcribe");
+        println!("words={} duration={:.1}s", normalized.words.len(), normalized.duration);
+        let raw = serde_json::to_string(&normalized).unwrap();
+        db.save_transcript(&project.id, "local", &raw, Some(&normalized.language))
+            .expect("save transcript");
+
+        // 2. Rank viral moments with Anthropic.
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
+            .expect("no Anthropic credential");
+        let drafts = llm::detect_candidates_with_claude(&normalized, &key)
+            .await.expect("detect candidates");
+        let candidates = db.replace_candidates(&project.id, &drafts).expect("save candidates");
+        println!("candidates={}", candidates.len());
+        for c in candidates.iter().take(3) {
+            println!("  [{:.0}s-{:.0}s] {:.2} {}", c.start_sec, c.end_sec, c.score, c.hook);
+        }
+
+        // 3. Cut the top candidate, captions burned in.
+        let top = candidates.first().expect("at least one candidate").clone();
+        let cut = cut_candidate_blocking(db.clone(), data_dir.clone(), top.id.clone())
+            .expect("cut");
+        println!("CUT={cut}");
+
+        // 4. B-roll.
+        let cut_path = PathBuf::from(&cut);
+        let broll_out = cut_path.with_file_name(format!(
+            "{}_broll.mp4", cut_path.file_stem().unwrap().to_string_lossy()));
+        let brolled = broll::enrich(&cut_path, &normalized.words, top.start_sec,
+                                    top.end_sec, &top.hook, &broll_out)
+            .expect("broll");
+        println!("BROLL={}", brolled.display());
+
+        // 5. Branded outro on the final artefact.
+        let words: Vec<_> = normalized.words.iter()
+            .filter(|w| w.end > top.start_sec && w.start < top.end_sec)
+            .map(|w| serde_json::json!({
+                "text": w.text, "start": w.start - top.start_sec,
+                "end": w.end - top.start_sec, "speaker": w.speaker }))
+            .collect();
+        let tpath = brolled.with_extension("outro_words.json");
+        std::fs::write(&tpath, serde_json::json!({"words": words}).to_string()).unwrap();
+
+        let final_out = brolled.with_file_name(format!(
+            "{}_final.mp4", brolled.file_stem().unwrap().to_string_lossy()));
+        let done = outro::append(&brolled, &app_name,
+                                 logo.as_ref().map(std::path::Path::new),
+                                 Some(&tpath), &final_out).expect("outro");
+        println!("FINAL={}", done.display());
+    }
+}
+
+#[cfg(test)]
+mod branding_tests {
+    use super::*;
+
+    /// Branding is optional: a project created without an app name must render
+    /// as before, and asking for an end card must refuse cleanly rather than
+    /// producing a broken clip.
+    #[test]
+    fn project_without_branding_has_no_end_card() {
+        let dir = std::env::temp_dir().join(format!("autoshorts-brand-{}", uuid::Uuid::new_v4()));
+        let db = Database::open(&dir.join("t.sqlite")).expect("open db");
+
+        let plain = db
+            .create_project("/tmp/x.mp4", "local", "classic-outline", Some(10.0), None, None)
+            .expect("create plain project");
+        assert!(plain.brand_name.is_none(), "no app name should be stored");
+        assert!(plain.brand_logo_path.is_none(), "no logo should be stored");
+
+        let branded = db
+            .create_project("/tmp/y.mp4", "local", "classic-outline", Some(10.0),
+                            Some("LabelWise: Food Scanner"),
+                            Some("/tmp/logo.png"))
+            .expect("create branded project");
+        assert_eq!(branded.brand_name.as_deref(), Some("LabelWise: Food Scanner"));
+        assert_eq!(branded.brand_logo_path.as_deref(), Some("/tmp/logo.png"));
+
+        // Blank strings count as absent, so a user tabbing through the fields
+        // does not end up with an empty end card.
+        let blank = db
+            .create_project("/tmp/z.mp4", "local", "classic-outline", Some(10.0), Some("  "), Some(""))
+            .expect("create blank-branding project");
+        assert!(blank.brand_name.is_none(), "whitespace app name must be treated as absent");
+        assert!(blank.brand_logo_path.is_none(), "empty logo path must be treated as absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

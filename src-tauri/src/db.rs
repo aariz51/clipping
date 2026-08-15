@@ -99,6 +99,9 @@ impl Database {
         )?;
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN caption_style TEXT", []);
+        // Branding for the end card, captured alongside the caption style.
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN brand_name TEXT", []);
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN brand_logo_path TEXT", []);
         Ok(())
     }
 
@@ -108,6 +111,8 @@ impl Database {
         transcription_mode: &str,
         caption_style: &str,
         source_duration: Option<f64>,
+        brand_name: Option<&str>,
+        brand_logo_path: Option<&str>,
     ) -> Result<Project> {
         let now = Utc::now().to_rfc3339();
         let project = Project {
@@ -118,14 +123,16 @@ impl Database {
             status: "ingest".to_string(),
             transcription_mode: transcription_mode.to_string(),
             caption_style: Some(caption_style.to_string()),
+            brand_name: brand_name.filter(|v| !v.trim().is_empty()).map(str::to_string),
+            brand_logo_path: brand_logo_path.filter(|v| !v.trim().is_empty()).map(str::to_string),
             created_at: now.clone(),
             updated_at: now,
         };
 
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute(
-            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO projects (id, name, source_path, source_duration, status, transcription_mode, caption_style, brand_name, brand_logo_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 project.id,
                 project.name,
@@ -134,6 +141,8 @@ impl Database {
                 project.status,
                 project.transcription_mode,
                 project.caption_style,
+                project.brand_name,
+                project.brand_logo_path,
                 project.created_at,
                 project.updated_at
             ],
@@ -145,7 +154,7 @@ impl Database {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, brand_name, brand_logo_path
              FROM projects ORDER BY updated_at DESC",
         )?;
 
@@ -157,7 +166,7 @@ impl Database {
     pub fn get_project(&self, project_id: &str) -> Result<Project> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.query_row(
-            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style
+            "SELECT id, name, source_path, source_duration, status, transcription_mode, created_at, updated_at, caption_style, brand_name, brand_logo_path
              FROM projects WHERE id = ?1",
             params![project_id],
             project_from_row,
@@ -325,7 +334,7 @@ impl Database {
                 candidates.id, candidates.project_id, candidates.start_sec, candidates.end_sec,
                 candidates.score, candidates.hook, candidates.rationale, candidates.rank, candidates.selected,
                 projects.id, projects.name, projects.source_path, projects.source_duration, projects.status,
-                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style
+                projects.transcription_mode, projects.created_at, projects.updated_at, projects.caption_style, projects.brand_name, projects.brand_logo_path
              FROM candidates
              INNER JOIN projects ON projects.id = candidates.project_id
              WHERE candidates.id = ?1",
@@ -353,6 +362,8 @@ impl Database {
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     caption_style: row.get(17)?,
+                    brand_name: row.get(18)?,
+                    brand_logo_path: row.get(19)?,
                 };
                 Ok((candidate, project))
             },
@@ -470,6 +481,8 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         caption_style: row.get(8)?,
+        brand_name: row.get(9)?,
+        brand_logo_path: row.get(10)?,
     })
 }
 

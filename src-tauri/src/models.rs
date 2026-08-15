@@ -19,6 +19,8 @@ pub struct EnvironmentStatus {
     pub has_ytdlp: bool,
     pub has_face_tracking: bool,
     pub has_caption_support: bool,
+    pub has_outro: bool,
+    pub has_voice_clone: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,10 @@ pub struct Project {
     pub status: String,
     pub transcription_mode: String,
     pub caption_style: Option<String>,
+    /// App name shown on the end card and spoken in the outro.
+    pub brand_name: Option<String>,
+    /// Absolute path to the app logo drawn on the end card.
+    pub brand_logo_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
