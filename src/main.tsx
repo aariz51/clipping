@@ -15,7 +15,6 @@ type EnvironmentStatus = {
   hasDeepseekKey: boolean;
   hasGeminiKey: boolean;
   hasOpenaiKey: boolean;
-  hasOpenrouterKey: boolean;
   hasGroqKey: boolean;
   llmProvider: string;
   hasLocalWhisperModel: boolean;
@@ -78,6 +77,22 @@ type Clip = {
   faceTrackJson: string | null;
   captionAssPath: string | null;
   renderLog: string | null;
+  brollPath: string | null;
+  postizState: string | null;
+  postizAt: string | null;
+};
+
+type BatchProgress = {
+  running: boolean;
+  done: number;
+  skipped: number;
+  failed: number;
+  currentProject: string | null;
+  currentTotal: number | null;
+  currentStep: string | null;
+  lastDone: string | null;
+  pass: string | null;
+  logPath: string;
 };
 
 type ProjectDetail = {
@@ -128,9 +143,13 @@ function App() {
   const [brollPaths, setBrollPaths] = useState<Record<string, string>>({});
   const [outroCandidateId, setOutroCandidateId] = useState<string | null>(null);
   const [outroPaths, setOutroPaths] = useState<Record<string, string>>({});
+  const [batch, setBatch] = useState<BatchProgress | null>(null);
   const [postizChannels, setPostizChannels] = useState<PostizChannel[]>([]);
+  const [postizLoading, setPostizLoading] = useState(false);
   const [postizBusy, setPostizBusy] = useState(false);
-  const [postizTarget, setPostizTarget] = useState<{ path: string; caption: string } | null>(null);
+  const [postizTarget, setPostizTarget] = useState<
+    { path: string; caption: string; candidateId?: string } | null
+  >(null);
   const [selectedChannels, setSelectedChannels] = useState<string[]>([]);
 
   async function addBroll(candidateId: string) {
@@ -159,9 +178,26 @@ function App() {
     }
   }
 
-  async function openPostiz(path: string, caption: string) {
+  /// Seed the in-memory B-roll paths from what the database recorded, so a
+  /// refresh or restart no longer reverts a finished clip to its plain cut.
+  function hydrateBrollPaths(d: ProjectDetail | null) {
+    if (!d) return;
+    const stored: Record<string, string> = {};
+    for (const clip of d.clips) {
+      if (clip.brollPath) stored[clip.candidateId] = clip.brollPath;
+    }
+    setBrollPaths((prev) => ({ ...stored, ...prev }));
+  }
+
+  async function openPostiz(path: string, caption: string, candidateId?: string) {
     setError(null);
-    setPostizTarget({ path, caption });
+    setPostizTarget({ path, caption, candidateId });
+    // The dialog opens before the channels are known, so it must say "loading"
+    // rather than "none connected" -- otherwise a slow fetch reads as an empty
+    // account. Postiz occasionally resets the connection and the sidecar then
+    // retries with a 2s backoff, which left a flatly wrong "No channels
+    // connected" on screen for seconds while two channels were being fetched.
+    setPostizLoading(true);
     try {
       const channels = await invoke<PostizChannel[]>("postiz_channels");
       setPostizChannels(channels);
@@ -169,20 +205,35 @@ function App() {
     } catch (err) {
       setError(String(err));
       setPostizTarget(null);
+    } finally {
+      setPostizLoading(false);
     }
   }
 
-  async function publishToPostiz(dryRun: boolean) {
+  async function publishToPostiz(dryRun: boolean, publishNow = false) {
     if (!postizTarget || selectedChannels.length === 0) return;
+    // Publishing is outward-facing and cannot be undone, so it is confirmed
+    // once. A draft is reversible and needs no confirmation.
+    if (publishNow && !dryRun) {
+      const names = postizChannels
+        .filter((c) => selectedChannels.includes(c.id))
+        .map((c) => c.profile || c.name || c.identifier)
+        .join(", ");
+      if (!window.confirm(`Publish this clip live to ${names}? This cannot be undone.`)) {
+        return;
+      }
+    }
     setPostizBusy(true);
     setError(null);
     try {
       await invoke<string>("publish_clip_to_postiz", {
         videoPath: postizTarget.path,
         caption: postizTarget.caption,
+        candidateId: postizTarget.candidateId ?? null,
         channelIds: selectedChannels,
         scheduleAt: null,
         dryRun,
+        publishNow,
       });
       setPostizTarget(null);
     } catch (err) {
@@ -201,8 +252,12 @@ function App() {
   const [transcriptionEngine, setTranscriptionEngine] = useState<"deepgram" | "local">(() => {
     return (localStorage.getItem("autoshorts_transcription_engine") as "deepgram" | "local") || "local";
   });
-  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq">(() => {
-    return (localStorage.getItem("autoshorts_llm_engine") as "claude" | "deepseek" | "local" | "gemini" | "openai" | "openrouter" | "groq") || "local";
+  const [llmEngine, setLlmEngine] = useState<"claude" | "deepseek" | "local" | "gemini" | "openai" | "groq">(() => {
+    const saved = localStorage.getItem("autoshorts_llm_engine");
+    // OpenRouter has been removed. A previously saved selection would otherwise
+    // keep being sent to the backend, which no longer serves it.
+    if (!saved || saved === "openrouter") return "claude";
+    return saved as "claude" | "deepseek" | "local" | "gemini" | "openai" | "groq";
   });
   const [localLlmModel, setLocalLlmModel] = useState(() => {
     return localStorage.getItem("autoshorts_local_llm_model") || "llama3.2";
@@ -225,14 +280,8 @@ function App() {
   const [openaiKey, setOpenaiKey] = useState(() => {
     return localStorage.getItem("autoshorts_openai_key") || "";
   });
-  const [openrouterKey, setOpenrouterKey] = useState(() => {
-    return localStorage.getItem("autoshorts_openrouter_key") || "";
-  });
   const [groqKey, setGroqKey] = useState(() => {
     return localStorage.getItem("autoshorts_groq_key") || "";
-  });
-  const [openrouterModel, setOpenrouterModel] = useState(() => {
-    return localStorage.getItem("autoshorts_openrouter_model") || "";
   });
 
   const [downloadingModelName, setDownloadingModelName] = useState<string | null>(null);
@@ -266,7 +315,6 @@ function App() {
   const canUseDeepseek = environment?.hasDeepseekKey || deepseekKey.trim().length > 0;
   const canUseGemini = environment?.hasGeminiKey || geminiKey.trim().length > 0;
   const canUseOpenai = environment?.hasOpenaiKey || openaiKey.trim().length > 0;
-  const canUseOpenrouter = environment?.hasOpenrouterKey || openrouterKey.trim().length > 0;
   const canUseGroq = environment?.hasGroqKey || groqKey.trim().length > 0;
 
   const canTranscribe = transcriptionEngine === "local"
@@ -283,11 +331,30 @@ function App() {
           ? canUseGemini
           : llmEngine === "openai"
             ? canUseOpenai
-            : llmEngine === "openrouter"
-              ? canUseOpenrouter
-              : llmEngine === "groq"
-                ? canUseGroq
-                : false;
+            : llmEngine === "groq"
+              ? canUseGroq
+              : false;
+
+  // Poll the background batch so the UI shows what is rendering right now.
+  // Reading a log file is cheap, so a short interval is fine and the panel
+  // stays live without the batch having to report in.
+  useEffect(() => {
+    let cancelled = false;
+    async function tick() {
+      try {
+        const p = await invoke<BatchProgress>("batch_progress");
+        if (!cancelled) setBatch(p);
+      } catch {
+        /* the command is unavailable in older builds; leave the panel hidden */
+      }
+    }
+    void tick();
+    const id = setInterval(() => void tick(), 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -335,17 +402,11 @@ function App() {
     localStorage.setItem("autoshorts_openai_key", openaiKey);
   }, [openaiKey]);
 
-  useEffect(() => {
-    localStorage.setItem("autoshorts_openrouter_key", openrouterKey);
-  }, [openrouterKey]);
 
   useEffect(() => {
     localStorage.setItem("autoshorts_groq_key", groqKey);
   }, [groqKey]);
 
-  useEffect(() => {
-    localStorage.setItem("autoshorts_openrouter_model", openrouterModel);
-  }, [openrouterModel]);
 
   const pullModelDirectly = async (modelName: string) => {
     setDownloadingModelName(modelName);
@@ -388,6 +449,7 @@ function App() {
     if (nextProjectId) {
       const nextDetail = await invoke<ProjectDetail>("get_project_detail", { projectId: nextProjectId });
       setDetail(nextDetail);
+      hydrateBrollPaths(nextDetail);
     } else {
       setDetail(null);
     }
@@ -516,14 +578,12 @@ function App() {
           llmEngine === "deepseek" ? deepseekKey :
             llmEngine === "gemini" ? geminiKey :
               llmEngine === "openai" ? openaiKey :
-                llmEngine === "openrouter" ? openrouterKey :
                   llmEngine === "groq" ? groqKey : "";
       const hasActiveKey =
         llmEngine === "claude" ? (env.hasAnthropicKey || activeKey.trim().length > 0) :
           llmEngine === "deepseek" ? (env.hasDeepseekKey || activeKey.trim().length > 0) :
             llmEngine === "gemini" ? (env.hasGeminiKey || activeKey.trim().length > 0) :
               llmEngine === "openai" ? (env.hasOpenaiKey || activeKey.trim().length > 0) :
-                llmEngine === "openrouter" ? (env.hasOpenrouterKey || activeKey.trim().length > 0) :
                   llmEngine === "groq" ? (env.hasGroqKey || activeKey.trim().length > 0) : false;
       if (!hasActiveKey) {
         const engineName =
@@ -531,7 +591,6 @@ function App() {
             llmEngine === "deepseek" ? "DeepSeek" :
               llmEngine === "gemini" ? "Gemini" :
                 llmEngine === "openai" ? "OpenAI" :
-                  llmEngine === "openrouter" ? "OpenRouter" :
                     llmEngine === "groq" ? "Groq" : "LLM";
         setError(`Transcription complete. ${engineName} API Key is missing. Please add it in settings to analyze viral moments.`);
         return;
@@ -561,13 +620,12 @@ function App() {
           llmEngine === "deepseek" ? deepseekKey.trim() :
             llmEngine === "gemini" ? geminiKey.trim() :
               llmEngine === "openai" ? openaiKey.trim() :
-                llmEngine === "openrouter" ? openrouterKey.trim() :
                   llmEngine === "groq" ? groqKey.trim() : "";
       await invoke<Candidate[]>("generate_candidates", {
         projectId,
         apiKey: activeKey || null,
         provider: llmEngine,
-        modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : (llmEngine === "openrouter" ? (openrouterModel.trim() || null) : null)),
+        modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : null),
         allowDemo: false,
       });
       await refresh(projectId);
@@ -625,6 +683,10 @@ function App() {
     await run("idle", async () => {
       const nextDetail = await invoke<ProjectDetail>("get_project_detail", { projectId });
       setDetail(nextDetail);
+      // Opening a project from the sidebar is the usual way in, so it needs the
+      // same rehydration as a refresh -- without it the card shows the plain
+      // cut and Post would upload a clip with no B-roll.
+      hydrateBrollPaths(nextDetail);
     });
   }
 
@@ -648,14 +710,13 @@ function App() {
           llmEngine === "deepseek" ? deepseekKey.trim() :
             llmEngine === "gemini" ? geminiKey.trim() :
               llmEngine === "openai" ? openaiKey.trim() :
-                llmEngine === "openrouter" ? openrouterKey.trim() :
                   llmEngine === "groq" ? groqKey.trim() : "";
       try {
         await invoke<Candidate[]>("generate_candidates", {
           projectId: detail.project.id,
           apiKey: activeKey || null,
           provider: llmEngine,
-          modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : (llmEngine === "openrouter" ? (openrouterModel.trim() || null) : null)),
+          modelName: llmEngine === "local" ? localLlmModel.trim() : (llmEngine === "deepseek" ? (deepseekModel.trim() || null) : null),
           allowDemo,
         });
         await refresh(detail.project.id);
@@ -741,14 +802,10 @@ function App() {
         setAnthropicKey={setAnthropicKey}
         setDeepseekKey={setDeepseekKey}
         setGroqKey={setGroqKey}
-        setOpenrouterKey={setOpenrouterKey}
-        setOpenrouterModel={setOpenrouterModel}
         deepgramKey={deepgramKey}
         anthropicKey={anthropicKey}
         deepseekKey={deepseekKey}
         groqKey={groqKey}
-        openrouterKey={openrouterKey}
-        openrouterModel={openrouterModel}
         refreshEnv={() => refresh()}
       />
     );
@@ -787,6 +844,56 @@ function App() {
             <Youtube size={18} />
             Import from YouTube
           </button>
+
+          {batch && (batch.running || batch.done > 0) && (
+            <section
+              aria-label="Batch rendering"
+              style={{
+                marginTop: "0.75rem", padding: "0.7rem 0.75rem", borderRadius: "10px",
+                border: "1px solid var(--border)",
+                background: batch.running ? "rgba(142, 230, 199, 0.07)" : "transparent",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", marginBottom: "0.35rem" }}>
+                {batch.running ? <Loader2 className="spin" size={14} /> : <Clapperboard size={14} />}
+                <strong style={{ fontSize: "0.82rem" }}>
+                  {batch.running ? "Rendering clips" : "Batch idle"}
+                </strong>
+                {batch.pass && batch.running && (
+                  <span style={{ fontSize: "0.7rem", opacity: 0.6 }}>pass {batch.pass}</span>
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: "0.9rem", fontSize: "0.75rem", marginBottom: "0.35rem" }}>
+                <span style={{ color: "var(--accent-primary)" }}>{batch.done} done</span>
+                <span style={{ opacity: 0.65 }}>{batch.skipped} skipped</span>
+                {batch.failed > 0 && (
+                  <span style={{ color: "#ff6b6b" }}>{batch.failed} failed</span>
+                )}
+              </div>
+
+              {batch.currentProject && (
+                <div style={{ fontSize: "0.72rem", opacity: 0.75, wordBreak: "break-all" }}>
+                  {batch.currentProject}
+                  {batch.currentTotal ? ` - ${batch.currentTotal} candidates` : ""}
+                </div>
+              )}
+
+              {batch.running && batch.currentStep && (
+                <div style={{ fontSize: "0.68rem", opacity: 0.55, marginTop: "0.3rem", wordBreak: "break-word" }}>
+                  {batch.currentStep.length > 90
+                    ? `${batch.currentStep.slice(0, 90)}...`
+                    : batch.currentStep}
+                </div>
+              )}
+
+              {batch.lastDone && (
+                <div style={{ fontSize: "0.68rem", opacity: 0.5, marginTop: "0.3rem", wordBreak: "break-all" }}>
+                  last: {batch.lastDone}
+                </div>
+              )}
+            </section>
+          )}
 
           <section className="project-list" aria-label="Projects">
             <button
@@ -857,7 +964,6 @@ function App() {
                         <option value="deepseek">DeepSeek (Cloud)</option>
                         <option value="gemini">Google Gemini (Cloud)</option>
                         <option value="openai">OpenAI (Cloud)</option>
-                        <option value="openrouter">OpenRouter (Cloud)</option>
                         <option value="groq">Groq (Cloud)</option>
                       </select>
                     </label>
@@ -926,28 +1032,6 @@ function App() {
                           type="password"
                         />
                       </label>
-                    )}
-                    {llmEngine === "openrouter" && (
-                      <>
-                        <label>
-                          <span>OpenRouter API Key</span>
-                          <input
-                            value={openrouterKey}
-                            onChange={(event) => setOpenrouterKey(event.target.value)}
-                            placeholder={environment?.hasOpenrouterKey ? "Loaded from env" : "Optional (OpenRouter API Key)"}
-                            type="password"
-                          />
-                        </label>
-                        <label>
-                          <span>OpenRouter Model</span>
-                          <input
-                            value={openrouterModel}
-                            onChange={(event) => setOpenrouterModel(event.target.value)}
-                            placeholder="Optional (e.g. google/gemini-2.5-flash, deepseek/deepseek-r1)"
-                            type="text"
-                          />
-                        </label>
-                      </>
                     )}
                     {llmEngine === "groq" && (
                       <label>
@@ -1070,8 +1154,7 @@ function App() {
                           llmEngine === "deepseek" ? "DeepSeek" :
                             llmEngine === "gemini" ? "Gemini" :
                               llmEngine === "openai" ? "OpenAI" :
-                                llmEngine === "openrouter" ? "OpenRouter" :
-                                  llmEngine === "groq" ? "Groq" : "LLM"
+                                                llmEngine === "groq" ? "Groq" : "LLM"
                         } API Key is missing. Viral moment identification will not work. Please add your key in API Settings.`}
                     </div>
                   )}
@@ -1127,6 +1210,26 @@ function App() {
                               <span className={`clip-status ${isCut ? "ready" : clip?.status === "error" ? "error" : ""}`}>
                                 {isCut ? "Cut ready" : clip?.status === "error" ? "Cut failed" : clip?.status ?? "Pending"}
                               </span>
+                              {clip?.postizState && (
+                                <span
+                                  className="clip-status"
+                                  title={
+                                    clip.postizAt
+                                      ? `${clip.postizState === "posted" ? "Posted" : "Drafted"} on ${new Date(
+                                          Number(clip.postizAt) * 1000,
+                                        ).toLocaleString()}`
+                                      : undefined
+                                  }
+                                  style={{
+                                    borderColor:
+                                      clip.postizState === "posted" ? "var(--accent-primary)" : "#d9a441",
+                                    color:
+                                      clip.postizState === "posted" ? "var(--accent-primary)" : "#d9a441",
+                                  }}
+                                >
+                                  {clip.postizState === "posted" ? "Posted" : "In draft"}
+                                </span>
+                              )}
                               <button
                                 className="cut-button"
                                 onClick={() => void cutCandidate(candidate.id)}
@@ -1183,6 +1286,7 @@ function App() {
                                         brollPaths[candidate.id] ||
                                         clip.outputPath!,
                                       candidate.hook,
+                                      candidate.id,
                                     )
                                   }
                                   disabled={busy !== "idle"}
@@ -1472,27 +1576,62 @@ function App() {
               <p>Select the channels to publish this clip to.</p>
             </div>
             <div className="output-path" style={{ marginBottom: "12px" }}>{postizTarget.path}</div>
-            <div className="form-stack" style={{ maxHeight: "260px", overflowY: "auto" }}>
-              {postizChannels.length === 0 && <p className="form-help">No channels connected in Postiz.</p>}
-              {postizChannels.map((ch) => (
-                <label key={ch.id} style={{ display: "flex", gap: "10px", alignItems: "center", padding: "6px 0" }}>
-                  <input
-                    type="checkbox"
-                    checked={selectedChannels.includes(ch.id)}
-                    onChange={(e) =>
-                      setSelectedChannels((prev) =>
-                        e.target.checked ? [...prev, ch.id] : prev.filter((id) => id !== ch.id),
-                      )
-                    }
-                  />
-                  <span>{ch.name || ch.profile || ch.id}</span>
-                  <span className="candidate-score">{ch.identifier}</span>
-                </label>
+            {postizChannels.length > 1 && (
+              <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "8px" }}>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => setSelectedChannels(postizChannels.map((c) => c.id))}
+                >
+                  Select all
+                </button>
+                <button type="button" className="icon-button" onClick={() => setSelectedChannels([])}>
+                  Clear
+                </button>
+                <span className="form-help" style={{ marginLeft: "auto" }}>
+                  {selectedChannels.length} of {postizChannels.length} selected
+                </span>
+              </div>
+            )}
+            <div className="form-stack" style={{ maxHeight: "300px", overflowY: "auto" }}>
+              {postizLoading && <p className="form-help">Loading channels from Postiz...</p>}
+              {!postizLoading && postizChannels.length === 0 && (
+                <p className="form-help">No channels connected in Postiz.</p>
+              )}
+              {/* Grouped by platform: with many accounts connected, scanning a
+                  flat list to find the right TikTok is the slow part. */}
+              {Array.from(new Set(postizChannels.map((c) => c.identifier || "other"))).map((platform) => (
+                <div key={platform} style={{ marginBottom: "10px" }}>
+                  <div className="form-help" style={{ textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "4px" }}>
+                    {platform}
+                  </div>
+                  {postizChannels
+                    .filter((c) => (c.identifier || "other") === platform)
+                    .map((ch) => (
+                      <label
+                        key={ch.id}
+                        style={{ display: "flex", gap: "10px", alignItems: "center", padding: "5px 0 5px 8px" }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedChannels.includes(ch.id)}
+                          onChange={(e) =>
+                            setSelectedChannels((prev) =>
+                              e.target.checked ? [...prev, ch.id] : prev.filter((id) => id !== ch.id),
+                            )
+                          }
+                        />
+                        <span>{ch.name || ch.profile || ch.id}</span>
+                        {ch.profile && <span className="candidate-score">@{ch.profile}</span>}
+                      </label>
+                    ))}
+                </div>
               ))}
             </div>
             <p className="form-help">
-              Publishing sends this video to the selected accounts immediately. Use Dry run to
-              upload and verify without posting.
+              <strong>Save as draft</strong> puts the clip in Postiz for you to review and publish
+              there. <strong>Post now</strong> publishes it live to the selected channels straight
+              away. Dry run uploads and resolves channels without creating anything.
             </p>
             <div className="onboarding-actions">
               <button className="icon-button" onClick={() => setPostizTarget(null)} disabled={postizBusy}>
@@ -1506,12 +1645,21 @@ function App() {
                 Dry run
               </button>
               <button
-                className="primary-action compact"
-                onClick={() => void publishToPostiz(false)}
+                className="icon-button"
+                onClick={() => void publishToPostiz(false, false)}
                 disabled={postizBusy || selectedChannels.length === 0}
               >
                 {postizBusy ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
-                Publish now
+                Save as draft
+              </button>
+              <button
+                className="primary-action compact"
+                onClick={() => void publishToPostiz(false, true)}
+                disabled={postizBusy || selectedChannels.length === 0}
+                title="Publish live to the selected channels now"
+              >
+                {postizBusy ? <Loader2 className="spin" size={16} /> : <Upload size={16} />}
+                Post now
               </button>
             </div>
           </div>
@@ -1649,20 +1797,16 @@ interface OnboardingProps {
   environment: EnvironmentStatus | null;
   onComplete: () => void;
   setTranscriptionEngine: (engine: "deepgram" | "local") => void;
-  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "groq" | "openrouter") => void;
+  setLlmEngine: (engine: "claude" | "deepseek" | "local" | "groq") => void;
   setLocalLlmModel: (model: string) => void;
   setDeepgramKey: (key: string) => void;
   setAnthropicKey: (key: string) => void;
   setDeepseekKey: (key: string) => void;
   setGroqKey: (key: string) => void;
-  setOpenrouterKey: (key: string) => void;
-  setOpenrouterModel: (model: string) => void;
   deepgramKey: string;
   anthropicKey: string;
   deepseekKey: string;
   groqKey: string;
-  openrouterKey: string;
-  openrouterModel: string;
   refreshEnv: () => Promise<void>;
 }
 
@@ -1676,14 +1820,10 @@ function Onboarding({
   setAnthropicKey,
   setDeepseekKey,
   setGroqKey,
-  setOpenrouterKey,
-  setOpenrouterModel,
   deepgramKey: initialDeepgramKey,
   anthropicKey: initialAnthropicKey,
   deepseekKey: initialDeepseekKey,
   groqKey: initialGroqKey,
-  openrouterKey: initialOpenrouterKey,
-  openrouterModel: initialOpenrouterModel,
   refreshEnv,
 }: OnboardingProps) {
   const [setupMode, setSetupMode] = useState<"choose" | "local" | "cloud" | "downloading">("choose");
@@ -1693,8 +1833,6 @@ function Onboarding({
   const [antKey, setAntKey] = useState(initialAnthropicKey);
   const [dsKey, setDsKey] = useState(initialDeepseekKey);
   const [grKey, setGrKey] = useState(initialGroqKey);
-  const [orKey, setOrKey] = useState(initialOpenrouterKey);
-  const [orModel, setOrModel] = useState(initialOpenrouterModel);
 
   // Transcription can run locally, so a Deepgram key is only mandatory when
   // Whisper is not installed.
@@ -1738,13 +1876,12 @@ function Onboarding({
     // A key already present in the environment (.env) counts as configured;
     // the backend falls back to it when the UI supplies none.
     const envLlm =
-      environment?.hasOpenrouterKey ||
       environment?.hasAnthropicKey ||
       environment?.hasDeepseekKey ||
       environment?.hasGroqKey;
 
-    if (!antKey.trim() && !dsKey.trim() && !grKey.trim() && !orKey.trim() && !envLlm) {
-      setError("Please provide at least one LLM Key (OpenRouter, Claude, DeepSeek, or Groq).");
+    if (!antKey.trim() && !dsKey.trim() && !grKey.trim() && !envLlm) {
+      setError("Please provide at least one LLM Key (Claude, DeepSeek, or Groq).");
       return;
     }
 
@@ -1760,24 +1897,15 @@ function Onboarding({
       localStorage.setItem("autoshorts_deepgram_key", dgKey.trim());
     }
 
-    // OpenRouter first: it fronts every other vendor, so if it is configured it
-    // is almost certainly the intended route.
-    if (orKey.trim() || environment?.hasOpenrouterKey) {
-      setLlmEngine("openrouter");
-      localStorage.setItem("autoshorts_llm_engine", "openrouter");
-      if (orKey.trim()) {
-        setOpenrouterKey(orKey.trim());
-        localStorage.setItem("autoshorts_openrouter_key", orKey.trim());
-      }
-      if (orModel.trim()) {
-        setOpenrouterModel(orModel.trim());
-        localStorage.setItem("autoshorts_openrouter_model", orModel.trim());
-      }
-    } else if (antKey.trim()) {
+    // Claude first. An Anthropic credential already in .env counts, so leaving
+    // the field blank still selects Claude rather than falling through.
+    if (antKey.trim() || environment?.hasAnthropicKey) {
       setLlmEngine("claude");
-      setAnthropicKey(antKey.trim());
-      localStorage.setItem("autoshorts_anthropic_key", antKey.trim());
       localStorage.setItem("autoshorts_llm_engine", "claude");
+      if (antKey.trim()) {
+        setAnthropicKey(antKey.trim());
+        localStorage.setItem("autoshorts_anthropic_key", antKey.trim());
+      }
     } else if (dsKey.trim()) {
       setLlmEngine("deepseek");
       setDeepseekKey(dsKey.trim());
@@ -2037,30 +2165,6 @@ function Onboarding({
               </div>
 
               <div className="input-group">
-                <label>OpenRouter API Key</label>
-                <input
-                  type="password"
-                  value={orKey}
-                  onChange={(e) => setOrKey(e.target.value)}
-                  placeholder={
-                    environment?.hasOpenrouterKey
-                      ? "Already set in .env - leave blank to use it"
-                      : "Insert your OpenRouter API Key (moment detection)"
-                  }
-                />
-              </div>
-
-              <div className="input-group">
-                <label>OpenRouter Model</label>
-                <input
-                  type="text"
-                  value={orModel}
-                  onChange={(e) => setOrModel(e.target.value)}
-                  placeholder="anthropic/claude-sonnet-4.5"
-                />
-              </div>
-
-              <div className="input-group">
                 <label>Claude API Key</label>
                 <input
                   type="password"
@@ -2091,8 +2195,8 @@ function Onboarding({
               </div>
               <p className="form-help">
                 {useLocalWhisper && whisperReady
-                  ? "Transcription runs locally. One LLM key (OpenRouter, Claude, DeepSeek, or Groq) is required."
-                  : "* Deepgram Key + at least one LLM Key (OpenRouter, Claude, DeepSeek, or Groq) is required."}
+                  ? "Transcription runs locally. One LLM key (Claude, DeepSeek, or Groq) is required."
+                  : "* Deepgram Key + at least one LLM Key (Claude, DeepSeek, or Groq) is required."}
               </p>
             </div>
 

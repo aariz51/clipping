@@ -185,6 +185,31 @@ def concat(clip: Path, outro: Path, out: Path, width: int, height: int, fps: str
         return False
 
 
+
+def system_tts(line: str, out: Path, female: bool) -> bool:
+    """Speak `line` with the OS voice, as a last resort.
+
+    Cloning is the goal -- the end card in the speaker's own voice is what makes
+    it feel part of the clip. But when the machine is too loaded for Chatterbox
+    to finish (observed at load average 900+, where a 15 minute budget still ran
+    out), the choice is between a generic voice and a silent card. A silent card
+    reads as a broken export, so a plain voice wins.
+    """
+    voice = "Samantha" if female else "Alex"
+    aiff = out.with_suffix(".aiff")
+    try:
+        subprocess.run(["say", "-v", voice, "-o", str(aiff), line],
+                       check=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(aiff), "-ar", "44100", "-ac", "1", str(out)],
+                       check=True, capture_output=True, text=True, timeout=120)
+        aiff.unlink(missing_ok=True)
+        return out.exists() and out.stat().st_size > 0
+    except Exception as exc:
+        log(f"system voice unavailable too: {exc}")
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clip", required=True)
@@ -230,6 +255,10 @@ def main() -> int:
     except Exception as exc:
         log(f"voice selection failed: {exc}")
 
+    # The fallback voice should match the speaker the clip actually chose, so a
+    # female-voiced clip does not end in a male system voice.
+    is_female = str(voice_info.get("gender", "")).lower().startswith("f")
+
     # 2. Clone it.
     voice_wav = work / "line.wav"
     cloner = Path(args.assets) / "tts_clone.py"
@@ -241,11 +270,17 @@ def main() -> int:
                 check=True, text=True, capture_output=True, timeout=900)
             log(f"cloned line: \"{line}\"")
         except subprocess.TimeoutExpired:
-            log("voice cloning timed out; outro will be silent")
+            log("voice cloning timed out; falling back to the system voice")
+            if system_tts(line, voice_wav, female=is_female):
+                log(f"system voice line: \"{line}\"")
         except subprocess.CalledProcessError as exc:
             log(f"voice cloning failed: {(exc.stderr or '')[-200:]}")
+            if system_tts(line, voice_wav, female=is_female):
+                log(f"system voice line: \"{line}\"")
     else:
-        log("voice cloning unavailable; outro will be silent")
+        log("voice cloning unavailable; using the system voice")
+        if system_tts(line, voice_wav, female=is_female):
+            log(f"system voice line: \"{line}\"")
 
     spoken = probe_float(voice_wav, "format=duration") if voice_wav.exists() else None
     seconds = min(MAX_OUTRO_SECONDS,

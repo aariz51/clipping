@@ -130,9 +130,11 @@ mod tests {
     #[ignore]
     fn dotenv_is_discoverable_from_src_tauri() {
         dotenvy::dotenv().expect("no .env found walking up from src-tauri");
-        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY missing");
-        assert!(key.starts_with("sk-or-"), "unexpected key format");
-        assert_eq!(std::env::var("LLM_PROVIDER").as_deref(), Ok("openrouter"));
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
+            .expect("no Anthropic credential in .env");
+        assert!(key.starts_with("sk-ant-"), "unexpected credential format");
+        assert_eq!(std::env::var("LLM_PROVIDER").as_deref(), Ok("claude"));
     }
 
     // Environment-dependent: run explicitly with `cargo test -- --ignored`.

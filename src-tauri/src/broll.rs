@@ -14,6 +14,9 @@ use serde::Serialize;
 use crate::models::TranscriptWord;
 
 const BROLL_PY: &str = include_str!("../assets/broll_pipeline.py");
+// The people screen needs the face detector beside the script: the sidecar runs
+// from its own materialised directory, not the source tree.
+const YUNET: &[u8] = include_bytes!("../assets/face_detection_yunet_2023mar.onnx");
 
 /// Where the b-rolls skill checkout lives. Overridable for a different clone.
 pub fn skill_dir() -> PathBuf {
@@ -47,6 +50,14 @@ fn sidecar() -> Option<PathBuf> {
         .unwrap_or(true);
     if stale {
         std::fs::write(&script, BROLL_PY).ok()?;
+    }
+
+    let model = base.join("face_detection_yunet_2023mar.onnx");
+    let model_stale = std::fs::metadata(&model)
+        .map(|m| m.len() != YUNET.len() as u64)
+        .unwrap_or(true);
+    if model_stale {
+        std::fs::write(&model, YUNET).ok()?;
     }
     Some(script)
 }
@@ -126,7 +137,10 @@ pub fn enrich(
         .arg("--skill-dir")
         .arg(skill_dir())
         .arg("--output")
-        .arg(output);
+        .arg(output)
+        // Where the screening models live, beside the materialised script.
+        .arg("--assets")
+        .arg(script.parent().unwrap_or(Path::new(".")));
     if let Some(t) = &transcript {
         cmd.arg("--transcript").arg(t);
     }

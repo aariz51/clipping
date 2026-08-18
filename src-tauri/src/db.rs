@@ -102,6 +102,15 @@ impl Database {
         // Branding for the end card, captured alongside the caption style.
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN brand_name TEXT", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN brand_logo_path TEXT", []);
+        // The B-roll result used to live only in the UI's memory, so a refresh
+        // silently reverted a finished clip to its plain cut -- and publishing
+        // then uploaded the version without B-roll.
+        let _ = conn.execute("ALTER TABLE clips ADD COLUMN broll_path TEXT", []);
+        // Whether this clip has been sent to Postiz, and when. Without it the
+        // app cannot tell a clip that is ready to post from one already posted,
+        // which is how the same video gets published twice.
+        let _ = conn.execute("ALTER TABLE clips ADD COLUMN postiz_state TEXT", []);
+        let _ = conn.execute("ALTER TABLE clips ADD COLUMN postiz_at TEXT", []);
         Ok(())
     }
 
@@ -316,6 +325,29 @@ impl Database {
         Ok(candidates)
     }
 
+    /// Record that a clip went to Postiz, as a draft or published live.
+    ///
+    /// Kept even when the same clip is sent again: the most recent action wins,
+    /// so a draft later published shows as posted.
+    pub fn set_postiz_state(&self, candidate_id: &str, state: &str, at: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE clips SET postiz_state = ?1, postiz_at = ?2 WHERE candidate_id = ?3",
+            params![state, at, candidate_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the B-roll render for a clip so it survives a refresh.
+    pub fn set_broll_path(&self, candidate_id: &str, path: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "UPDATE clips SET broll_path = ?1 WHERE candidate_id = ?2",
+            params![path, candidate_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_candidates(&self, project_id: &str) -> Result<Vec<Candidate>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
@@ -409,7 +441,7 @@ impl Database {
     fn list_clips_for_project(&self, project_id: &str) -> Result<Vec<Clip>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT clips.id, clips.candidate_id, clips.status, clips.output_path, clips.face_track_json, clips.caption_ass_path, clips.render_log
+            "SELECT clips.id, clips.candidate_id, clips.status, clips.output_path, clips.face_track_json, clips.caption_ass_path, clips.render_log, clips.broll_path, clips.postiz_state, clips.postiz_at
              FROM clips
              INNER JOIN candidates ON candidates.id = clips.candidate_id
              WHERE candidates.project_id = ?1
@@ -424,6 +456,9 @@ impl Database {
                 face_track_json: row.get(4)?,
                 caption_ass_path: row.get(5)?,
                 render_log: row.get(6)?,
+                broll_path: row.get(7).ok(),
+                postiz_state: row.get(8).ok().flatten(),
+                postiz_at: row.get(9).ok().flatten(),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

@@ -11,7 +11,6 @@ pub struct EnvironmentStatus {
     pub has_deepseek_key: bool,
     pub has_gemini_key: bool,
     pub has_openai_key: bool,
-    pub has_openrouter_key: bool,
     pub has_groq_key: bool,
     pub llm_provider: String,
     pub has_local_whisper_model: bool,
@@ -87,6 +86,15 @@ pub struct Clip {
     pub face_track_json: Option<String>,
     pub caption_ass_path: Option<String>,
     pub render_log: Option<String>,
+    /// The B-roll version of this clip, once one has been rendered.
+    #[serde(default)]
+    pub broll_path: Option<String>,
+    /// "draft" or "posted", once the clip has been sent to Postiz.
+    #[serde(default)]
+    pub postiz_state: Option<String>,
+    /// When that happened, ISO-8601.
+    #[serde(default)]
+    pub postiz_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

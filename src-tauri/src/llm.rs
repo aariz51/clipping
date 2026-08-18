@@ -35,6 +35,7 @@ pub async fn detect_candidates_with_deepseek(
     api_key: &str,
     model_name: Option<&str>,
 ) -> Result<Vec<CandidateDraft>> {
+    ATTEMPT.with(|a| a.set(0));
     let segments = compact_segments(&transcript.segments);
     let prompt = format!(
         "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
@@ -89,12 +90,7 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("DeepSeek response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    parse_candidate_json(&text, transcript)
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,12 +172,7 @@ Transcript:
         .and_then(|p| p.text.clone())
         .ok_or_else(|| anyhow!("Gemini response did not include content text"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    parse_candidate_json(&text, transcript)
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,117 +244,7 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("OpenAI response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
-}
-
-pub async fn detect_candidates_with_openrouter(
-    transcript: &NormalizedTranscript,
-    api_key: &str,
-    model_name: Option<&str>,
-) -> Result<Vec<CandidateDraft>> {
-    let segments = compact_segments(&transcript.segments);
-    let prompt = format!(
-        "You are an elite, world-class social media strategist with a track record of generating viral multi-million-view Shorts, TikToks, and Reels. \
-Your sole objective is to identify the ABSOLUTE BEST, most highly-engaging, and trend-setting short-form clip candidates from the provided transcript. \
-Do NOT pick random or mediocre segments. Be ruthless in your selection, but extract AS MANY highly viral moments as possible. \
-Every candidate must have an insanely strong, curiosity-inducing hook in the first 3 seconds to stop the scroll. \
-Clips should be 30-90 seconds long, completely self-contained, cut at clean boundaries, and deliver a massive payoff (a mind-blowing fact, hilarious joke, highly controversial opinion, or deep emotional insight). \
-Return up to 25 candidates as JSON matching exactly this schema: \
-{{\"candidates\":[{{\"start\":0.0,\"end\":0.0,\"score\":0.0,\"hook\":\"...\",\"rationale\":\"...\"}}]}}
-
-Transcript:
-{segments}"
-    );
-
-    let default_model = "google/gemini-2.5-flash".to_string();
-    let model = model_name
-        .filter(|m| !m.trim().is_empty())
-        .map(|m| m.trim().to_string())
-        .or_else(|| std::env::var("OPENROUTER_MODEL").ok().filter(|m| !m.trim().is_empty()))
-        .unwrap_or(default_model);
-
-    // OpenRouter fronts many vendors and not all accept `response_format`.
-    // Anthropic models in particular reject JSON mode, so it is requested only
-    // where supported, and a rejection is retried without it. The parser
-    // tolerates prose-wrapped JSON either way.
-    let supports_json_mode = {
-        let m = model.to_lowercase();
-        !(m.contains("anthropic") || m.contains("claude"))
-    };
-
-    let client = reqwest::Client::new();
-    let build_body = |json_mode: bool| {
-        let mut body = json!({
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            "temperature": 0.2,
-        });
-        if json_mode {
-            body["response_format"] = json!({ "type": "json_object" });
-        }
-        body
-    };
-
-    let send = |json_mode: bool| {
-        client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .header("Authorization", format!("Bearer {api_key}"))
-            // OpenRouter attributes traffic via these; harmless but expected.
-            .header("HTTP-Referer", "https://github.com/JayWebtech/autoshorts")
-            .header("X-Title", "AutoShorts")
-            .json(&build_body(json_mode))
-            .send()
-    };
-
-    let mut json_mode = supports_json_mode;
-    let mut response = send(json_mode).await.context("calling OpenRouter")?;
-
-    if !response.status().is_success() && json_mode {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        // Only a complaint about the JSON-mode parameter is worth retrying.
-        if body.to_lowercase().contains("response_format") {
-            json_mode = false;
-            response = send(json_mode)
-                .await
-                .context("retrying OpenRouter without JSON mode")?;
-        } else {
-            return Err(anyhow!("OpenRouter request failed ({status}): {body}"));
-        }
-    }
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("OpenRouter request failed ({status}): {body}"));
-    }
-
-    let res_body: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("parsing OpenRouter response")?;
-    let text = res_body
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .ok_or_else(|| anyhow!("OpenRouter response did not include choices content"))?;
-
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    parse_candidate_json(&text, transcript)
 }
 
 pub async fn detect_candidates_with_groq(
@@ -423,18 +304,56 @@ Transcript:
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow!("Groq response did not include choices content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    parse_candidate_json(&text, transcript)
 }
 
 #[derive(Debug, Serialize)]
 struct ClaudeMessage<'a> {
     role: &'a str,
     content: String,
+}
+
+/// One short text completion from Claude, for small side tasks like writing a
+/// clip title. Shares the credential handling of the candidate detector.
+pub async fn ask_claude_text(prompt: &str, api_key: &str) -> Result<String> {
+    let model =
+        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+    let is_oauth = api_key.starts_with("sk-ant-oat");
+    let mut builder = reqwest::Client::new()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("anthropic-version", "2023-06-01");
+    builder = if is_oauth {
+        builder
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+    } else {
+        builder.header("x-api-key", api_key)
+    };
+
+    let response = builder
+        .json(&json!({
+            "model": model,
+            "max_tokens": 64,
+            "messages": [ClaudeMessage { role: "user", content: prompt.to_string() }]
+        }))
+        .send()
+        .await
+        .context("calling Claude")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(anyhow!("Claude request failed ({status})"));
+    }
+    let message: AnthropicMessage = response.json().await.context("parsing Claude response")?;
+    message
+        .content
+        .into_iter()
+        .find_map(|c| c.text)
+        .ok_or_else(|| anyhow!("Claude returned no text"))
+}
+
+thread_local! {
+    static ATTEMPT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 pub async fn detect_candidates_with_claude(
@@ -475,27 +394,56 @@ Transcript:
         builder.header("x-api-key", api_key)
     };
 
-    let response = builder
-        .json(&json!({
-            "model": model,
-            "max_tokens": 8000,
-            "temperature": 0.2,
-            "messages": [
-                ClaudeMessage {
-                    role: "user",
-                    content: prompt,
-                }
-            ]
-        }))
-        .send()
-        .await
-        .context("calling Claude")?;
+    let body = json!({
+        "model": model,
+        "max_tokens": 8000,
+        "temperature": 0.2,
+        "messages": [
+            ClaudeMessage {
+                role: "user",
+                content: prompt,
+            }
+        ]
+    });
 
-    if !response.status().is_success() {
+    // Ranking runs back to back across a batch of sources, which is exactly the
+    // shape that trips a per-minute limit. A 429 means "wait", so wait: failing
+    // here would abandon a whole video over a pause of a few seconds.
+    const MAX_ATTEMPTS: u32 = 6;
+    let response = loop {
+        let attempt = ATTEMPT.with(|a| {
+            let n = a.get();
+            a.set(n + 1);
+            n
+        });
+        let response = builder
+            .try_clone()
+            .ok_or_else(|| anyhow!("could not retry Claude request"))?
+            .json(&body)
+            .send()
+            .await
+            .context("calling Claude")?;
+
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Claude request failed ({status}): {body}"));
-    }
+        if status.is_success() {
+            break response;
+        }
+        let retryable = status.as_u16() == 429 || status.is_server_error();
+        if !retryable || attempt + 1 >= MAX_ATTEMPTS {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Claude request failed ({status}): {detail}"));
+        }
+        // Prefer the server's own answer over guessing.
+        let wait = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| 2u64.pow(attempt + 1))
+            .min(60);
+        eprintln!("[llm] Claude {status}; waiting {wait}s (attempt {}/{MAX_ATTEMPTS})", attempt + 1);
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    };
 
     let message: AnthropicMessage = response.json().await.context("parsing Claude response")?;
     let text = message
@@ -504,12 +452,7 @@ Transcript:
         .find_map(|content| content.text)
         .ok_or_else(|| anyhow!("Claude response did not include text content"))?;
 
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&text, min_duration)
+    parse_candidate_json(&text, transcript)
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,12 +536,7 @@ Ensure the 'start' and 'end' values correspond to actual timestamps in the trans
         .json()
         .await
         .context("parsing local Ollama response")?;
-    let min_duration = if transcript.duration < 60.0 {
-        (transcript.duration * 0.5).max(5.0)
-    } else {
-        30.0
-    };
-    parse_candidate_json(&res_body.message.content, min_duration)
+    parse_candidate_json(&res_body.message.content, transcript)
 }
 
 fn compact_segments(segments: &[TranscriptSegment]) -> String {
@@ -617,7 +555,7 @@ fn compact_segments(segments: &[TranscriptSegment]) -> String {
 
 /// Find the first balanced JSON object or array inside a model reply.
 ///
-/// Not every model can be pinned to JSON mode — Anthropic via OpenRouter, and
+/// Not every model can be pinned to JSON mode — Anthropic, and
 /// local Ollama models, routinely wrap the payload in a sentence or two. Brace
 /// matching (skipping over string literals) recovers it without a regex.
 fn extract_json_span(text: &str) -> Option<&str> {
@@ -655,7 +593,67 @@ fn extract_json_span(text: &str) -> Option<&str> {
     None
 }
 
-fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDraft>> {
+/// Boundaries a clip may be cut on: every segment edge, in order.
+fn segment_boundaries(transcript: &NormalizedTranscript) -> Vec<f64> {
+    let mut edges: Vec<f64> = transcript
+        .segments
+        .iter()
+        .flat_map(|s| [s.start, s.end])
+        .collect();
+    edges.sort_by(f64::total_cmp);
+    edges.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    edges
+}
+
+/// Grow a too-short candidate to `min_duration` along segment boundaries.
+///
+/// Models reliably return the *moment* -- a 12 second reveal -- rather than a
+/// publishable clip, and the old code simply discarded anything under the
+/// floor. On a typical source that threw away 23 of 24 good moments. Extending
+/// to the surrounding segment edges keeps the cut clean (it still lands on a
+/// sentence boundary, never mid-word) while making the clip long enough to
+/// stand on its own. Preference is to extend *forwards*, so the hook the model
+/// picked stays at the start where it stops the scroll.
+fn fit_to_min_duration(
+    candidate: &mut CandidateDraft,
+    boundaries: &[f64],
+    min_duration: f64,
+    total: f64,
+) {
+    if candidate.end - candidate.start >= min_duration {
+        return;
+    }
+    // Forwards first: later edges, nearest one that reaches the floor.
+    if let Some(&edge) = boundaries
+        .iter()
+        .find(|&&e| e > candidate.end && e - candidate.start >= min_duration)
+    {
+        candidate.end = edge.min(total);
+    }
+    // Still short (the clip runs to the end of the source): borrow from before
+    // the hook rather than leaving an unusable fragment.
+    if candidate.end - candidate.start < min_duration {
+        if let Some(&edge) = boundaries
+            .iter()
+            .rev()
+            .find(|&&e| e < candidate.start && candidate.end - e >= min_duration)
+        {
+            candidate.start = edge.max(0.0);
+        }
+    }
+}
+
+fn parse_candidate_json(
+    text: &str,
+    transcript: &NormalizedTranscript,
+) -> Result<Vec<CandidateDraft>> {
+    let min_duration = if transcript.duration < 60.0 {
+        (transcript.duration * 0.5).max(5.0)
+    } else {
+        30.0
+    };
+    let boundaries = segment_boundaries(transcript);
+    let total = transcript.duration;
     let trimmed = text
         .trim()
         .trim_start_matches("```json")
@@ -718,7 +716,7 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
         )
     })?;
 
-    let mut drafts = Vec::new();
+    let mut drafts: Vec<CandidateDraft> = Vec::new();
     for item in &concrete_arr {
         let start = match item.get("start") {
             Some(v) => {
@@ -796,6 +794,10 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
         });
     }
 
+    for draft in drafts.iter_mut() {
+        fit_to_min_duration(draft, &boundaries, min_duration, total);
+    }
+
     let mut candidates = drafts
         .clone()
         .into_iter()
@@ -815,7 +817,14 @@ fn parse_candidate_json(text: &str, min_duration: f64) -> Result<Vec<CandidateDr
 
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut candidates = suppress_overlaps(candidates, 0.5);
-    candidates.truncate(10);
+    // The prompt asks for up to 25 moments; keep them all after overlap
+    // suppression so a long source yields as many distinct clips as it holds.
+    // Overridable for callers that only want the strongest few.
+    let cap = std::env::var("MAX_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(25);
+    candidates.truncate(cap);
     Ok(candidates)
 }
 
@@ -880,12 +889,70 @@ mod tests {
         assert_eq!(extract_json_span(reply), Some(reply));
     }
 
+    /// A transcript of `count` one-second segments, for parser tests.
+    fn transcript_of(count: usize) -> NormalizedTranscript {
+        NormalizedTranscript {
+            language: "en".into(),
+            duration: count as f64,
+            speakers: vec!["Speaker".into()],
+            words: vec![],
+            segments: (0..count)
+                .map(|i| TranscriptSegment {
+                    start: i as f64,
+                    end: (i + 1) as f64,
+                    text: "word".into(),
+                    speaker: None,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn parses_prose_wrapped_candidates() {
         let reply = "Here you go:\n{\"candidates\":[{\"start\":10.0,\"end\":50.0,\"score\":0.9,\
                      \"hook\":\"h\",\"rationale\":\"r\"}]}";
-        let parsed = parse_candidate_json(reply, 30.0).expect("should recover JSON from prose");
+        let parsed = parse_candidate_json(reply, &transcript_of(200))
+            .expect("should recover JSON from prose");
         assert_eq!(parsed.len(), 1);
+    }
+
+    /// The regression that cost 23 of 24 clips: short moments were dropped
+    /// outright instead of being extended to a publishable length.
+    #[test]
+    fn short_moments_are_extended_not_discarded() {
+        let reply = r#"{"candidates":[
+            {"start":10.0,"end":22.0,"score":0.9,"hook":"a","rationale":"r"},
+            {"start":80.0,"end":95.0,"score":0.8,"hook":"b","rationale":"r"},
+            {"start":150.0,"end":160.0,"score":0.7,"hook":"c","rationale":"r"}]}"#;
+        let parsed = parse_candidate_json(reply, &transcript_of(200)).expect("parse");
+        assert_eq!(parsed.len(), 3, "every moment should survive");
+        for c in &parsed {
+            assert!(c.end - c.start >= 30.0, "{:?} is still too short", c);
+            assert!(c.end <= 200.0, "extended past the end of the source");
+        }
+    }
+
+    /// Extending must not invent a boundary: the clip still starts and ends on
+    /// a segment edge, so the cut never lands mid-sentence.
+    #[test]
+    fn extension_lands_on_segment_boundaries() {
+        let reply = r#"{"candidates":[{"start":10.0,"end":18.0,"score":0.9,"hook":"a","rationale":"r"}]}"#;
+        let parsed = parse_candidate_json(reply, &transcript_of(200)).expect("parse");
+        let c = &parsed[0];
+        assert_eq!(c.start, 10.0, "hook should stay at the start");
+        assert_eq!(c.end.fract(), 0.0, "end should sit on a segment edge");
+        assert!(c.end - c.start >= 30.0);
+    }
+
+    /// A moment at the very end of the source cannot extend forwards, so it
+    /// must borrow from before the hook rather than be thrown away.
+    #[test]
+    fn moment_at_the_end_extends_backwards() {
+        let reply = r#"{"candidates":[{"start":192.0,"end":200.0,"score":0.9,"hook":"a","rationale":"r"}]}"#;
+        let parsed = parse_candidate_json(reply, &transcript_of(200)).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].end - parsed[0].start >= 30.0);
+        assert!(parsed[0].end <= 200.0);
     }
 
     fn draft(start: f64, end: f64, score: f64) -> CandidateDraft {
@@ -991,28 +1058,4 @@ mod live_tests {
         }
     }
 
-    /// Hits the live OpenRouter API. Costs a few cents.
-    /// Run with: cargo test --lib -- --ignored --nocapture live_openrouter
-    #[tokio::test]
-    #[ignore]
-    async fn live_openrouter_claude_returns_candidates() {
-        let _ = dotenvy::from_path("../.env");
-        let key = std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY not set");
-        let model = std::env::var("OPENROUTER_MODEL")
-            .unwrap_or_else(|_| "anthropic/claude-sonnet-4.5".to_string());
-
-        let out = detect_candidates_with_openrouter(&pregnancy_transcript(), &key, Some(&model))
-            .await
-            .expect("OpenRouter call failed");
-
-        assert!(!out.is_empty(), "no candidates returned");
-        println!("\n=== {} returned {} candidates ===", model, out.len());
-        for c in &out {
-            println!(
-                "  [{:6.1}s -> {:6.1}s] score {:.2}\n    hook: {}",
-                c.start, c.end, c.score, c.hook
-            );
-            assert!(c.end > c.start, "candidate has non-positive duration");
-        }
-    }
 }

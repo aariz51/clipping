@@ -80,15 +80,18 @@ pub fn channels() -> Result<Vec<Channel>, String> {
     Ok(parsed.into_iter().filter(|c| !c.disabled).collect())
 }
 
-/// Publish `video` to the given channels. Empty `channel_ids` posts to all.
+/// Send `video` to the given channels. Empty `channel_ids` targets all.
 ///
-/// `when` schedules for an ISO timestamp; `None` publishes immediately.
+/// Creates a **draft** unless `publish` is set. Posting straight from
+/// automation is what gets accounts rate-limited or shadow-banned, so the clip
+/// lands in Postiz for review and going live stays a deliberate act.
 pub fn publish(
     video: &Path,
     caption: &str,
     channel_ids: &[String],
     when: Option<&str>,
     dry_run: bool,
+    publish_now: bool,
 ) -> Result<String, String> {
     use std::ffi::OsStr;
 
@@ -109,6 +112,9 @@ pub fn publish(
     }
     if dry_run {
         args.push(OsStr::new("--dry-run"));
+    }
+    if publish_now {
+        args.push(OsStr::new("--publish"));
     }
     run(&args)
 }

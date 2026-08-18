@@ -7,6 +7,9 @@ mod media;
 mod models;
 mod outro;
 mod postiz;
+mod progress;
+mod sfx;
+mod title;
 mod pyenv;
 mod transcription;
 
@@ -55,11 +58,10 @@ async fn environment_status(state: tauri::State<'_, AppState>) -> Result<Environ
         has_ffmpeg: media::command_exists("ffmpeg"),
         has_ffprobe: media::command_exists("ffprobe"),
         has_deepgram_key: std::env::var("DEEPGRAM_API_KEY").is_ok(),
-        has_anthropic_key: std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        has_anthropic_key: anthropic_credential().is_some(),
         has_deepseek_key: std::env::var("DEEPSEEK_API_KEY").is_ok(),
         has_gemini_key: std::env::var("GEMINI_API_KEY").is_ok(),
         has_openai_key: std::env::var("OPENAI_API_KEY").is_ok(),
-        has_openrouter_key: std::env::var("OPENROUTER_API_KEY").is_ok(),
         has_groq_key: std::env::var("GROQ_API_KEY").is_ok(),
         llm_provider,
         has_local_whisper_model,
@@ -438,6 +440,21 @@ fn save_demo_transcript(
     Ok(saved)
 }
 
+/// The Anthropic credential, in either shape the API accepts.
+///
+/// A console key (`sk-ant-api...`) and a Claude Code subscription token
+/// (`sk-ant-oat...`) authenticate differently but are both valid credentials,
+/// so either one counts as "Claude is configured". Looking only at
+/// `ANTHROPIC_API_KEY` made a perfectly good OAuth token look like no
+/// credential at all.
+fn anthropic_credential() -> Option<String> {
+    ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 #[tauri::command]
 async fn generate_candidates(
     state: tauri::State<'_, AppState>,
@@ -457,14 +474,15 @@ async fn generate_candidates(
 
     let active_provider = provider
         .or_else(|| std::env::var("LLM_PROVIDER").ok())
-        .unwrap_or_else(|| "deepseek".to_string())
+        .unwrap_or_else(|| "claude".to_string())
         .to_lowercase();
 
     let drafts = match active_provider.as_str() {
         "claude" => {
             let key = api_key
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| "Set ANTHROPIC_API_KEY or supply Claude API Key to generate candidates.".to_string())?;
+                .filter(|k| !k.trim().is_empty())
+                .or_else(anthropic_credential)
+                .ok_or_else(|| "Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, or supply a Claude key, to generate candidates.".to_string())?;
             llm::detect_candidates_with_claude(&normalized, &key)
                 .await
                 .map_err(to_command_error)?
@@ -490,14 +508,6 @@ async fn generate_candidates(
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .ok_or_else(|| "Set OPENAI_API_KEY or supply OpenAI API Key to generate candidates.".to_string())?;
             llm::detect_candidates_with_openai(&normalized, &key)
-                .await
-                .map_err(to_command_error)?
-        }
-        "openrouter" => {
-            let key = api_key
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .ok_or_else(|| "Set OPENROUTER_API_KEY or supply OpenRouter API Key to generate candidates.".to_string())?;
-            llm::detect_candidates_with_openrouter(&normalized, &key, model_name.as_deref())
                 .await
                 .map_err(to_command_error)?
         }
@@ -549,8 +559,10 @@ async fn add_broll_to_clip(
     candidate_id: String,
 ) -> Result<String, String> {
     let db = state.db.clone();
+    let candidate_id_for_task = candidate_id.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let enriched = tokio::task::spawn_blocking(move || -> Result<(PathBuf, Candidate, Vec<TranscriptWord>), String> {
+        let candidate_id = candidate_id_for_task;
         let (candidate, project) = db
             .get_candidate_with_project(&candidate_id)
             .map_err(to_command_error)?;
@@ -600,10 +612,105 @@ async fn add_broll_to_clip(
             &topic,
             &output,
         )?;
-        Ok(produced.to_string_lossy().to_string())
+        Ok((produced, candidate, words))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let (produced, candidate, words) = enriched;
+
+    // A persistent headline across the top, so a scroller knows the subject
+    // before hearing a word. Applied after B-roll so it sits over every scene,
+    // not just the speaker ones.
+    let spoken: String = words
+        .iter()
+        .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let headline = title::write_title(&spoken, &candidate.hook).await;
+
+    let db2 = state.db.clone();
+    let cid = candidate_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let titled_out = produced.with_file_name(format!(
+            "{}_titled.mp4",
+            produced.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+        // A failure here must not lose the B-roll render, so fall back to the
+        // untitled file rather than erroring the whole action.
+        let final_path = match title::apply(&produced, &headline, &titled_out) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[title] skipped: {e}");
+                produced.clone()
+            }
+        };
+
+        // Sound effects, chosen from the edit. The video stream is copied, so
+        // this adds atmosphere without touching picture quality.
+        let plan = produced
+            .parent()
+            .map(|d| d.join(format!(
+                "edit_{}",
+                produced.file_stem().unwrap_or_default().to_string_lossy()
+                    .replace("_broll", ""))).join("scene_plan.json"));
+        let tx = produced.parent().map(|d| d.join("broll_transcript.json"));
+        let sfx_out = final_path.with_file_name(format!(
+            "{}_sfx.mp4",
+            final_path.file_stem().unwrap_or_default().to_string_lossy()));
+        let final_path = match sfx::apply(
+            &final_path, plan.as_deref(), tx.as_deref(), &sfx_out) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[sfx] skipped: {e}");
+                final_path
+            }
+        };
+
+        let final_path = final_path.to_string_lossy().to_string();
+        db2.set_broll_path(&cid, &final_path)
+            .map_err(to_command_error)?;
+        Ok(final_path)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// True when the project carries real branding the user actually supplied.
+///
+/// An outro is only wanted when there is something to advertise. Checking
+/// merely that a name exists let a placeholder through -- a project created by
+/// the end-to-end test defaulted to "My App" and every clip ended with "My App
+/// - Download on the App Store & Google Play", which is worse than no outro.
+/// Both a real name and a logo are required, so an unbranded project ends on
+/// its own last frame.
+pub(crate) fn has_real_branding(project: &Project) -> bool {
+    const PLACEHOLDERS: [&str; 4] = ["my app", "app name", "your app", "test"];
+    let named = project
+        .brand_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| !PLACEHOLDERS.contains(&n.to_lowercase().as_str()))
+        .unwrap_or(false);
+    let logo = project
+        .brand_logo_path
+        .as_deref()
+        .map(|p| !p.trim().is_empty() && std::path::Path::new(p).exists())
+        .unwrap_or(false);
+    named && logo
+}
+
+/// Whether the *automated* pipeline should append an end card.
+///
+/// It should not. An end card is an advert, and whether a clip carries one is
+/// an editorial decision the user makes per clip with the "Add Outro" button --
+/// not something a batch decides on their behalf. This stays separate from
+/// `has_real_branding` so the branding check keeps its plain meaning.
+/// `OUTRO_IN_BATCH=1` opts the batch back in.
+pub(crate) fn batch_should_add_outro(project: &Project) -> bool {
+    std::env::var("OUTRO_IN_BATCH").ok().as_deref() == Some("1") && has_real_branding(project)
 }
 
 /// Appending the branded end card, independent of Tauri state so the same code
@@ -688,6 +795,13 @@ async fn add_outro_to_clip(
 }
 
 #[tauri::command]
+async fn batch_progress() -> Result<progress::BatchProgress, String> {
+    tokio::task::spawn_blocking(progress::read)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn postiz_channels() -> Result<Vec<postiz::Channel>, String> {
     tokio::task::spawn_blocking(postiz::channels)
         .await
@@ -696,24 +810,46 @@ async fn postiz_channels() -> Result<Vec<postiz::Channel>, String> {
 
 #[tauri::command]
 async fn publish_clip_to_postiz(
+    state: tauri::State<'_, AppState>,
     video_path: String,
     caption: String,
     channel_ids: Vec<String>,
     schedule_at: Option<String>,
     dry_run: bool,
+    publish_now: Option<bool>,
+    candidate_id: Option<String>,
 ) -> Result<String, String> {
+    let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(&video_path);
         if !path.exists() {
             return Err(format!("video not found: {video_path}"));
         }
-        postiz::publish(
+        let published = publish_now.unwrap_or(false);
+        let out = postiz::publish(
             &path,
             &caption,
             &channel_ids,
             schedule_at.as_deref(),
             dry_run,
-        )
+            published,
+        )?;
+
+        // Record the outcome so the card can show it. A dry run changes
+        // nothing in Postiz, so it must not mark the clip either.
+        if !dry_run {
+            if let Some(cid) = candidate_id {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default();
+                let label = if published { "posted" } else { "draft" };
+                if let Err(e) = db.set_postiz_state(&cid, label, &stamp) {
+                    eprintln!("[postiz] could not record state: {e}");
+                }
+            }
+        }
+        Ok(out)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -877,8 +1013,51 @@ fn rename_project(
     state.db.rename_project(&project_id, &name).map_err(to_command_error)
 }
 
+/// Load `.env` from wherever it actually is.
+///
+/// `dotenvy::dotenv()` walks up from the *working directory*, which is fine
+/// under `tauri dev` (launched from `src-tauri/`) but useless for a bundled
+/// `.app`: Finder starts it with the working directory at `/`, so the file is
+/// never found and every API credential silently goes missing. These locations
+/// cover both, plus an explicit override.
+fn load_env() {
+    if let Ok(explicit) = std::env::var("AUTOSHORTS_ENV") {
+        if dotenvy::from_path(&explicit).is_ok() {
+            eprintln!("[env] loaded {explicit}");
+            return;
+        }
+    }
+    if let Ok(path) = dotenvy::dotenv() {
+        eprintln!("[env] loaded {}", path.display());
+        return;
+    }
+
+    let mut tried: Vec<PathBuf> = Vec::new();
+    // Beside the executable, then upwards: inside a bundle that climbs out of
+    // `AutoShorts.app/Contents/MacOS` and on to the checkout it was built from.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(std::path::Path::to_path_buf);
+        while let Some(d) = dir {
+            tried.push(d.join(".env"));
+            dir = d.parent().map(std::path::Path::to_path_buf);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        tried.push(home.join("autoshorts/.env"));
+        tried.push(home.join(".autoshorts/.env"));
+    }
+
+    for path in tried {
+        if path.is_file() && dotenvy::from_path(&path).is_ok() {
+            eprintln!("[env] loaded {}", path.display());
+            return;
+        }
+    }
+    eprintln!("[env] no .env found; API credentials must come from the environment");
+}
+
 pub fn run() {
-    let _ = dotenvy::dotenv();
+    load_env();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -914,6 +1093,7 @@ pub fn run() {
             add_broll_to_clip,
             add_outro_to_clip,
             postiz_channels,
+            batch_progress,
             publish_clip_to_postiz
         ])
         .run(tauri::generate_context!())
@@ -1416,6 +1596,20 @@ mod pipeline_tests {
                                     &candidate.hook, &broll_out).expect("broll failed");
         println!("STEP2_BROLL={}", brolled.display());
 
+        // STEP 2b: the persistent title banner, exactly as the button applies it.
+        let spoken: String = words.iter()
+            .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+            .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        let headline = tokio::runtime::Runtime::new().unwrap()
+            .block_on(title::write_title(&spoken, &candidate.hook));
+        println!("STEP2b_TITLE={headline}");
+        let titled_out = brolled.with_file_name(format!(
+            "{}_titled.mp4", brolled.file_stem().unwrap().to_string_lossy()));
+        let brolled = match title::apply(&brolled, &headline, &titled_out) {
+            Ok(p) => { println!("STEP2b_TITLED={}", p.display()); p }
+            Err(e) => { println!("title skipped: {e}"); brolled }
+        };
+
         // 3. Add Outro button - the exact command the button invokes. Branding
         // is optional, so a project without an app name must refuse cleanly and
         // leave the B-roll cut as the finished video.
@@ -1496,6 +1690,19 @@ mod e2e_tests {
             .expect("broll");
         println!("BROLL={}", brolled.display());
 
+        // 4b. Persistent title banner across the top, over every scene.
+        let spoken: String = normalized.words.iter()
+            .filter(|w| w.end > top.start_sec && w.start < top.end_sec)
+            .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        let headline = title::write_title(&spoken, &top.hook).await;
+        println!("TITLE={headline}");
+        let titled_out = brolled.with_file_name(format!(
+            "{}_titled.mp4", brolled.file_stem().unwrap().to_string_lossy()));
+        let brolled = match title::apply(&brolled, &headline, &titled_out) {
+            Ok(p) => { println!("TITLED={}", p.display()); p }
+            Err(e) => { println!("title skipped: {e}"); brolled }
+        };
+
         // 5. Branded outro on the final artefact.
         let words: Vec<_> = normalized.words.iter()
             .filter(|w| w.end > top.start_sec && w.start < top.end_sec)
@@ -1550,5 +1757,633 @@ mod branding_tests {
         assert!(blank.brand_logo_path.is_none(), "empty logo path must be treated as absent");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    /// Continue an interrupted import: reuse the audio already extracted for an
+    /// existing project, then transcribe, rank, cut, B-roll and close with the
+    /// end card. Avoids re-downloading and re-extracting a long source.
+    ///
+    /// RESUME_PROJECT=<id> cargo test --lib -- --ignored --nocapture resume_pipeline
+    #[tokio::test]
+    #[ignore]
+    async fn resume_pipeline() {
+        let _ = dotenvy::from_path("../.env");
+        let project_id = std::env::var("RESUME_PROJECT").expect("RESUME_PROJECT not set");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+        let project = db.get_project(&project_id).expect("project");
+
+        // Reuse an existing transcript when the run died after that point.
+        let normalized = match db.latest_transcript(&project_id).ok().flatten() {
+            Some(t) => {
+                println!("reusing saved transcript");
+                serde_json::from_str::<NormalizedTranscript>(&t.raw_json).expect("parse transcript")
+            }
+            None => {
+                let audio = data_dir.join("projects").join(&project_id).join("transcription_audio.wav");
+                let audio = if audio.exists() {
+                    println!("reusing extracted audio");
+                    audio
+                } else {
+                    media::extract_audio(&project.source_path,
+                                         &data_dir.join("projects").join(&project_id))
+                        .expect("extract audio")
+                };
+                println!("transcribing (slow step)...");
+                let n = transcription::transcribe_local(
+                    &audio.to_string_lossy(), &data_dir.to_string_lossy())
+                    .await.expect("transcribe");
+                db.save_transcript(&project_id, "local",
+                                   &serde_json::to_string(&n).unwrap(), Some(&n.language))
+                    .expect("save transcript");
+                n
+            }
+        };
+        println!("words={} duration={:.1}s", normalized.words.len(), normalized.duration);
+
+        let mut candidates = db.list_candidates(&project_id).unwrap_or_default();
+        if candidates.is_empty() {
+            let key = std::env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
+                .expect("no Anthropic credential");
+            let drafts = llm::detect_candidates_with_claude(&normalized, &key)
+                .await.expect("detect candidates");
+            candidates = db.replace_candidates(&project_id, &drafts).expect("save candidates");
+        }
+        println!("candidates={}", candidates.len());
+        for c in candidates.iter().take(3) {
+            println!("  [{:.0}s-{:.0}s] {:.2} {}", c.start_sec, c.end_sec, c.score, c.hook);
+        }
+
+        let top = candidates.first().expect("a candidate").clone();
+        let cut = cut_candidate_blocking(db.clone(), data_dir.clone(), top.id.clone())
+            .expect("cut");
+        println!("CUT={cut}");
+
+        let cut_path = PathBuf::from(&cut);
+        let broll_out = cut_path.with_file_name(format!(
+            "{}_broll.mp4", cut_path.file_stem().unwrap().to_string_lossy()));
+        let brolled = broll::enrich(&cut_path, &normalized.words, top.start_sec,
+                                    top.end_sec, &top.hook, &broll_out).expect("broll");
+        println!("BROLL={}", brolled.display());
+
+        match add_outro_blocking(db, top.id, brolled.to_string_lossy().to_string()) {
+            Ok(f) => println!("FINAL={f}"),
+            Err(e) => println!("OUTRO SKIPPED: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Render every candidate of every project that has a transcript.
+    ///
+    /// Resumable: a candidate whose finished file already exists is skipped, so
+    /// an interrupted run continues rather than repeating hours of encoding.
+    /// Re-ranks first when a project holds fewer candidates than MAX_CANDIDATES,
+    /// so raising the cap yields more clips from sources already transcribed.
+    ///
+    /// cargo test --lib -- --ignored --nocapture batch_render_all
+    #[tokio::test]
+    #[ignore]
+    async fn batch_render_all() {
+        let _ = dotenvy::from_path("../.env");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+        let want: usize = std::env::var("MAX_CANDIDATES").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(25);
+
+        let mut projects = db.list_projects().expect("projects");
+        // Skip the duplicate branding-test projects: same source, same clips.
+        let mut seen_sources = std::collections::HashSet::new();
+        projects.retain(|p| seen_sources.insert(p.source_path.clone()));
+        println!("BATCH: {} unique source(s)", projects.len());
+
+        let mut made = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+
+        for project in projects {
+            let Some(transcript) = db.latest_transcript(&project.id).ok().flatten() else {
+                println!("SKIP {}: no transcript", &project.id[..8]);
+                continue;
+            };
+            let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&transcript.raw_json)
+            else {
+                println!("SKIP {}: unreadable transcript", &project.id[..8]);
+                continue;
+            };
+
+            let mut candidates = db.list_candidates(&project.id).unwrap_or_default();
+            if candidates.len() < want {
+                let key = std::env::var("ANTHROPIC_API_KEY")
+                    .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
+                    .unwrap_or_default();
+                if !key.is_empty() {
+                    println!("RANK {}: {} -> asking for up to {}",
+                             &project.id[..8], candidates.len(), want);
+                    match llm::detect_candidates_with_claude(&normalized, &key).await {
+                        Ok(drafts) => {
+                            if drafts.len() > candidates.len() {
+                                let _ = db.replace_candidates(&project.id, &drafts);
+                            }
+                        }
+                        Err(e) => println!("  ranking failed, keeping existing: {e}"),
+                    }
+                    // Re-read rather than trusting the returned vector: ranking
+                    // replaces rows, and the app may hold the database open at
+                    // the same time. The stored rows are the only ones whose ids
+                    // the cut step can resolve.
+                    candidates = db.list_candidates(&project.id).unwrap_or_default();
+                }
+            }
+            println!("PROJECT {} ({}): {} candidate(s)",
+                     &project.id[..8],
+                     std::path::Path::new(&project.source_path)
+                         .file_name().unwrap_or_default().to_string_lossy(),
+                     candidates.len());
+
+            for candidate in candidates {
+                let label = format!("{}#{}", &project.id[..8], candidate.rank);
+
+                let cut = match cut_candidate_blocking(
+                    db.clone(), data_dir.clone(), candidate.id.clone()) {
+                    Ok(c) => c,
+                    Err(e) if e.contains("no rows") => {
+                        println!("  SKIP {label}: candidate no longer in the database");
+                        skipped += 1;
+                        continue;
+                    }
+                    Err(e) => { println!("  FAIL {label} cut: {e}"); failed += 1; continue; }
+                };
+                let cut_path = PathBuf::from(&cut);
+                let broll_out = cut_path.with_file_name(format!(
+                    "{}_broll.mp4", cut_path.file_stem().unwrap().to_string_lossy()));
+                let final_out = broll_out.with_file_name(format!(
+                    "{}_final.mp4", broll_out.file_stem().unwrap().to_string_lossy()));
+
+                // Resume: a finished clip is left alone.
+                //
+                // The artefact name grew as stages were added (_broll ->
+                // _titled -> _titled_sfx -> _titled_sfx_final), and a check that
+                // only knew the old names stopped recognising finished work --
+                // so the batch re-planned clips it had already rendered and
+                // burned quota doing it. Check every finished form there is.
+                let stem = broll_out.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let finished_forms = [
+                    format!("{stem}_titled_sfx_final.mp4"),
+                    format!("{stem}_titled_sfx.mp4"),
+                    format!("{stem}_titled_final.mp4"),
+                    format!("{stem}_titled.mp4"),
+                    format!("{stem}_final.mp4"),
+                ];
+                if let Some(found) = finished_forms
+                    .iter()
+                    .map(|n| broll_out.with_file_name(n))
+                    .find(|p| p.exists())
+                {
+                    println!("  SKIP {label}: already rendered ({})",
+                             found.file_name().unwrap_or_default().to_string_lossy());
+                    // Make sure the app knows about it even if an earlier run
+                    // finished before paths were being recorded.
+                    let _ = db.set_broll_path(&candidate.id, &found.to_string_lossy());
+                    skipped += 1;
+                    continue;
+                }
+                let _ = &final_out;
+
+                let brolled = if broll_out.exists() {
+                    broll_out.clone()
+                } else {
+                    match broll::enrich(&cut_path, &normalized.words, candidate.start_sec,
+                                        candidate.end_sec, &candidate.hook, &broll_out) {
+                        Ok(b) => b,
+                        Err(e) => { println!("  FAIL {label} broll: {e}"); failed += 1; continue; }
+                    }
+                };
+
+                // Persistent headline across the top, applied after B-roll so
+                // it holds over every scene and before the outro so it does not
+                // sit on the end card.
+                let spoken: String = normalized.words.iter()
+                    .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+                    .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+                let headline = title::write_title(&spoken, &candidate.hook).await;
+                let titled_out = brolled.with_file_name(format!(
+                    "{}_titled.mp4",
+                    brolled.file_stem().unwrap_or_default().to_string_lossy()));
+                let brolled = match title::apply(&brolled, &headline, &titled_out) {
+                    Ok(p) => { println!("  TITLE {label}: {headline}"); p }
+                    Err(e) => { println!("  title skipped {label}: {e}"); brolled }
+                };
+
+                // Sound effects, placed from the edit itself. Mixed before the
+                // outro so the end card keeps its own cloned-voice line clean,
+                // and after the title because the video stream is copied here --
+                // adding sound costs no picture quality.
+                let plan = cut_path.with_file_name(format!(
+                    "edit_{}", cut_path.file_stem().unwrap_or_default().to_string_lossy()))
+                    .join("scene_plan.json");
+                let tx = cut_path.with_file_name("broll_transcript.json");
+                let sfx_out = brolled.with_file_name(format!(
+                    "{}_sfx.mp4",
+                    brolled.file_stem().unwrap_or_default().to_string_lossy()));
+                let brolled = match sfx::apply(&brolled, Some(&plan), Some(&tx), &sfx_out) {
+                    Ok(p) => { println!("  SFX {label}"); p }
+                    Err(e) => { println!("  sfx skipped {label}: {e}"); brolled }
+                };
+
+                // No end card unless it is asked for. Appending it in bulk
+                // put an advert on clips that were never meant to carry one;
+                // the outro is now a deliberate press of the clip's own button.
+                let finished = brolled.to_string_lossy().to_string();
+                // Record it, so the app shows the finished clip and its path
+                // instead of offering to build one that already exists.
+                if let Err(e) = db.set_broll_path(&candidate.id, &finished) {
+                    println!("  (could not record path: {e})");
+                }
+                println!("  DONE {label}: {finished}");
+                made += 1;
+            }
+        }
+        println!("\nBATCH COMPLETE: {made} rendered, {skipped} already done, {failed} failed");
+    }
+}
+
+#[cfg(test)]
+mod rank_debug {
+    use super::*;
+
+    /// Re-rank one project and check the rows actually land in the database.
+    /// RANK_PROJECT=<id> cargo test --lib -- --ignored --nocapture rank_persists
+    #[tokio::test]
+    #[ignore]
+    async fn rank_persists() {
+        let _ = dotenvy::from_path("../.env");
+        let pid = std::env::var("RANK_PROJECT").expect("RANK_PROJECT not set");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+
+        let before = db.list_candidates(&pid).unwrap_or_default().len();
+        let t = db.latest_transcript(&pid).unwrap().unwrap();
+        let n: NormalizedTranscript = serde_json::from_str(&t.raw_json).unwrap();
+
+        let key = std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN")).unwrap();
+        let drafts = llm::detect_candidates_with_claude(&n, &key).await.expect("rank");
+        println!("MAX_CANDIDATES={:?}", std::env::var("MAX_CANDIDATES"));
+        println!("drafts returned by llm : {}", drafts.len());
+
+        let saved = db.replace_candidates(&pid, &drafts).expect("save");
+        println!("replace_candidates gave: {}", saved.len());
+
+        let after = db.list_candidates(&pid).unwrap_or_default();
+        println!("rows in db after       : {}", after.len());
+        println!("before                 : {before}");
+
+        // The bug to catch: ids handed back that are not actually stored.
+        let stored: std::collections::HashSet<_> = after.iter().map(|c| c.id.clone()).collect();
+        let missing: Vec<_> = saved.iter().filter(|c| !stored.contains(&c.id)).collect();
+        println!("handed back but NOT in db: {}", missing.len());
+    }
+}
+
+#[cfg(test)]
+mod broll_path_tests {
+    use super::*;
+
+    /// Confirms the B-roll path survives the round trip the UI depends on:
+    /// database -> project_detail -> serialised JSON field `brollPath`.
+    /// PROJ=<project_id> cargo test --lib -- --ignored --nocapture broll_path_reaches_ui
+    #[test]
+    #[ignore]
+    fn broll_path_reaches_ui() {
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+        let pid = std::env::var("PROJ").expect("PROJ not set");
+        let detail = db.project_detail(&pid).expect("detail");
+        let json = serde_json::to_value(&detail).expect("serialise");
+        let clips = json["clips"].as_array().expect("clips array");
+        let mut found = 0;
+        for c in clips {
+            if let Some(b) = c["brollPath"].as_str() {
+                found += 1;
+                println!("brollPath present: {b}");
+            }
+        }
+        println!("clips: {}, with brollPath: {found}", clips.len());
+        assert!(found > 0, "no clip carried brollPath through to the UI payload");
+    }
+}
+
+#[cfg(test)]
+mod retitle_tests {
+    use super::*;
+
+    /// Add the title banner to every clip already rendered, without redoing the
+    /// expensive work.
+    ///
+    /// A clip's B-roll plan costs thousands of tokens; its title costs a few
+    /// dozen. So finished renders are retitled in place rather than rebuilt --
+    /// the whole sweep costs about as much as planning one clip. Where the
+    /// project is branded, the outro is re-appended afterwards so the banner
+    /// does not sit over the end card. Outro rendering is entirely local, so
+    /// that step costs no quota at all.
+    ///
+    /// cargo test --lib --release -- --ignored --nocapture retitle_all
+    #[tokio::test]
+    #[ignore]
+    async fn retitle_all() {
+        let _ = dotenvy::from_path("../.env");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+
+        let projects = db.list_projects().expect("projects");
+        let mut done = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+
+        for project in projects {
+            let Some(transcript) = db.latest_transcript(&project.id).ok().flatten() else {
+                continue;
+            };
+            let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&transcript.raw_json)
+            else {
+                continue;
+            };
+
+            for candidate in db.list_candidates(&project.id).unwrap_or_default() {
+                let Ok(clips_dir) = documents_project_dir(&project).map(|d| d.join("clips"))
+                else {
+                    continue;
+                };
+                let broll = clips_dir.join(format!("clip-{:02}_flat_broll.mp4", candidate.rank));
+                if !broll.exists() {
+                    continue;
+                }
+                let titled = clips_dir.join(format!("clip-{:02}_flat_broll_titled.mp4", candidate.rank));
+                if titled.exists() {
+                    println!("SKIP {} #{}: already titled", &project.id[..8], candidate.rank);
+                    skipped += 1;
+                    continue;
+                }
+
+                let spoken: String = normalized
+                    .words
+                    .iter()
+                    .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let headline = title::write_title(&spoken, &candidate.hook).await;
+
+                match title::apply(&broll, &headline, &titled) {
+                    Ok(p) => {
+                        println!("TITLED {} #{}: \"{headline}\" -> {}",
+                                 &project.id[..8], candidate.rank, p.display());
+                        done += 1;
+                        // Same sound pass the batch applies, so a retitled clip
+                        // is indistinguishable from a freshly rendered one.
+                        let plan = clips_dir
+                            .join(format!("edit_clip-{:02}_flat", candidate.rank))
+                            .join("scene_plan.json");
+                        let tx = clips_dir.join("broll_transcript.json");
+                        let sfx_out = clips_dir.join(
+                            format!("clip-{:02}_flat_broll_titled_sfx.mp4", candidate.rank));
+                        let p = match sfx::apply(&p, Some(&plan), Some(&tx), &sfx_out) {
+                            Ok(q) => { println!("  sfx mixed"); q }
+                            Err(e) => { println!("  sfx skipped: {e}"); p }
+                        };
+                        // Outro deliberately not applied here either.
+                        let _ = &project;
+                        {
+                            let _ = db.set_broll_path(
+                                &candidate.id, &p.to_string_lossy().to_string());
+                        }
+                    }
+                    Err(e) => {
+                        println!("FAIL {} #{}: {e}", &project.id[..8], candidate.rank);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+        println!("\nRETITLE COMPLETE: {done} titled, {skipped} already done, {failed} failed");
+    }
+}
+
+#[cfg(test)]
+mod parallel_batch {
+    use super::*;
+
+    /// Render every pending clip, several at a time.
+    ///
+    /// The serial batch spent most of its wall-clock waiting: one Anthropic
+    /// planning call, then minutes of ffmpeg, then the next call. Running
+    /// several clips at once overlaps one clip's encode with another's planning,
+    /// which both finishes sooner and spends the quota while it is available.
+    ///
+    /// Safe to parallelise because each clip now owns its working directory and
+    /// its downloads are named per clip, so two renders cannot touch the same
+    /// files. Concurrency is deliberately modest: ffmpeg is itself threaded, so
+    /// too many workers thrash rather than help.
+    ///
+    /// BATCH_CONCURRENCY=3 cargo test --lib --release -- --ignored --nocapture render_parallel
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn render_parallel() {
+        let _ = dotenvy::from_path("../.env");
+        let data_dir = dirs::data_dir().unwrap().join("com.autoshorts.desktop");
+        let db = Database::open(&data_dir.join("autoshorts.sqlite")).expect("open db");
+        let concurrency: usize = std::env::var("BATCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        // Build the work list first, so the pending set is known up front and
+        // the same clip cannot be picked up twice.
+        let mut work: Vec<(Project, Candidate, NormalizedTranscript)> = Vec::new();
+        let mut projects = db.list_projects().expect("projects");
+        let mut seen = std::collections::HashSet::new();
+        projects.retain(|p| seen.insert(p.source_path.clone()));
+
+        for project in projects {
+            let Some(t) = db.latest_transcript(&project.id).ok().flatten() else { continue };
+            let Ok(normalized) = serde_json::from_str::<NormalizedTranscript>(&t.raw_json) else {
+                continue;
+            };
+            let Ok(clips_dir) = documents_project_dir(&project).map(|d| d.join("clips")) else {
+                continue;
+            };
+            for candidate in db.list_candidates(&project.id).unwrap_or_default() {
+                let stem = format!("clip-{:02}_flat_broll", candidate.rank);
+                let finished = [
+                    format!("{stem}_titled_sfx_final.mp4"),
+                    format!("{stem}_titled_sfx.mp4"),
+                    format!("{stem}_titled.mp4"),
+                    format!("{stem}_final.mp4"),
+                ]
+                .iter()
+                .any(|n| clips_dir.join(n).exists());
+                if finished {
+                    continue;
+                }
+                work.push((project.clone(), candidate, normalized.clone()));
+            }
+        }
+        println!("PARALLEL: {} clip(s) pending, {concurrency} at a time", work.len());
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut set = tokio::task::JoinSet::new();
+
+        for (project, candidate, normalized) in work {
+            let sem = sem.clone();
+            let db = db.clone();
+            let data_dir = data_dir.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                let label = format!("{}#{}", &project.id[..8], candidate.rank);
+
+                let cut = tokio::task::spawn_blocking({
+                    let db = db.clone();
+                    let data_dir = data_dir.clone();
+                    let cid = candidate.id.clone();
+                    move || cut_candidate_blocking(db, data_dir, cid)
+                })
+                .await
+                .ok()?;
+                let cut = match cut {
+                    Ok(c) => PathBuf::from(c),
+                    Err(e) => { println!("  FAIL {label} cut: {e}"); return None; }
+                };
+
+                let broll_out = cut.with_file_name(format!(
+                    "{}_broll.mp4", cut.file_stem().unwrap_or_default().to_string_lossy()));
+                let brolled = tokio::task::spawn_blocking({
+                    let words = normalized.words.clone();
+                    let (s, e, hook) = (candidate.start_sec, candidate.end_sec, candidate.hook.clone());
+                    let (cut, out) = (cut.clone(), broll_out.clone());
+                    move || broll::enrich(&cut, &words, s, e, &hook, &out)
+                })
+                .await
+                .ok()?;
+                let brolled = match brolled {
+                    Ok(b) => b,
+                    Err(e) => { println!("  FAIL {label} broll: {e}"); return None; }
+                };
+
+                let spoken: String = normalized.words.iter()
+                    .filter(|w| w.end > candidate.start_sec && w.start < candidate.end_sec)
+                    .map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+                let headline = title::write_title(&spoken, &candidate.hook).await;
+                println!("  TITLE {label}: {headline}");
+
+                let finished = tokio::task::spawn_blocking({
+                    let db = db.clone();
+                    let cid = candidate.id.clone();
+                    let branded = batch_should_add_outro(&project);
+                    let cut = cut.clone();
+                    move || {
+                        let titled = brolled.with_file_name(format!(
+                            "{}_titled.mp4",
+                            brolled.file_stem().unwrap_or_default().to_string_lossy()));
+                        let v = title::apply(&brolled, &headline, &titled).unwrap_or(brolled);
+
+                        let plan = cut.with_file_name(format!(
+                            "edit_{}", cut.file_stem().unwrap_or_default().to_string_lossy()))
+                            .join("scene_plan.json");
+                        let tx = cut.with_file_name("broll_transcript.json");
+                        let sfx_out = v.with_file_name(format!(
+                            "{}_sfx.mp4", v.file_stem().unwrap_or_default().to_string_lossy()));
+                        let v = sfx::apply(&v, Some(&plan), Some(&tx), &sfx_out).unwrap_or(v);
+
+                        // No end card unless it is asked for. Aariz adds the
+                        // outro himself from the clip's own button when he
+                        // wants one, so appending it automatically put an
+                        // advert on clips that were never meant to carry one.
+                        let _ = branded;
+                        let _ = db.set_broll_path(&cid, &v.to_string_lossy());
+                        v
+                    }
+                })
+                .await
+                .ok()?;
+                println!("  DONE {label}: {}", finished.display());
+                Some(())
+            });
+        }
+
+        let mut made = 0usize;
+        while let Some(res) = set.join_next().await {
+            if matches!(res, Ok(Some(()))) { made += 1; }
+        }
+        println!("\nPARALLEL COMPLETE: {made} rendered");
+    }
+}
+
+#[cfg(test)]
+mod branding_gate_tests {
+    use super::*;
+
+    fn project_with(name: Option<&str>, logo: Option<&str>) -> Project {
+        Project {
+            id: "t".into(),
+            name: None,
+            source_path: "/tmp/x.mp4".into(),
+            source_duration: None,
+            status: "ready".into(),
+            transcription_mode: "local".into(),
+            caption_style: None,
+            brand_name: name.map(str::to_string),
+            brand_logo_path: logo.map(str::to_string),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// The end card advertised "My App - download on the App Store" on a
+    /// project that never had an app name: a placeholder left by a test run
+    /// satisfied a bare is_some() check. A placeholder is not branding.
+    #[test]
+    fn placeholder_app_name_is_not_branding() {
+        for name in ["My App", "my app", "  App Name  ", "your app", "TEST"] {
+            assert!(
+                !has_real_branding(&project_with(Some(name), Some("/tmp"))),
+                "{name:?} should not count as branding"
+            );
+        }
+    }
+
+    /// A real name with no logo is still not enough to brand the end card.
+    #[test]
+    fn a_name_without_a_logo_is_not_branding() {
+        assert!(!has_real_branding(&project_with(Some("LabelWise"), None)));
+        assert!(!has_real_branding(&project_with(Some("LabelWise"), Some(""))));
+        assert!(!has_real_branding(&project_with(
+            Some("LabelWise"),
+            Some("/nope/missing-logo.png")
+        )));
+    }
+
+    /// A real name plus a logo that exists on disk does brand it.
+    ///
+    /// The logo is created here rather than borrowed from the system: pointing
+    /// at a path like /etc/hosts makes the test depend on the host's layout.
+    #[test]
+    fn real_name_and_present_logo_is_branding() {
+        let logo = std::env::temp_dir().join("autoshorts_test_logo.png");
+        std::fs::write(&logo, b"not really a png, but it exists").expect("write logo");
+        assert!(has_real_branding(&project_with(
+            Some("LabelWise: Food Scanner"),
+            Some(&logo.to_string_lossy())
+        )));
+        let _ = std::fs::remove_file(&logo);
     }
 }
